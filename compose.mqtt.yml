@@ -1,0 +1,89 @@
+# Hourly-only MQTT deployment for current esphome-neurio-openevse firmware,
+# which no longer publishes neurio/raw. This file stands alone. Do not combine
+# it with compose.yml (that file remains the Home Assistant deployment).
+#
+# Host environment (Compose interpolates .env, then the shell):
+#   PUBLISH_ADDRESS          host IP that publishes 8095 (default 192.168.86.20)
+#   DATA_HOST_PATH           default /srv/neurio-recorder/data
+#   BACKUP_HOST_PATH         default /srv/neurio-recorder/backups
+#   MQTT_BROKER_HOST         default 192.168.86.7
+#   MQTT_BROKER_PORT         default 1883
+#   MQTT_USERNAME            required; no default
+#   MQTT_PASSWORD_HOST_FILE  default /srv/neurio-recorder/mqtt_password
+#   NEURIO_HOURLY_STALE_AFTER_SECONDS  default 3900
+#
+# The broker password is the Compose file secret mqtt_password. It is not a
+# value in this file or in .env. The host file is mounted read-only at
+# /run/secrets/mqtt_password. There is no Home Assistant token.
+
+name: neurio-lan-collector
+
+services:
+  neurio-recorder:
+    image: neurio-lan-collector:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.25
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - ${DATA_HOST_PATH:-/srv/neurio-recorder/data}:/data
+      - ${BACKUP_HOST_PATH:-/srv/neurio-recorder/backups}:/backups
+    secrets:
+      - mqtt_password
+    ports:
+      - "${PUBLISH_ADDRESS:-192.168.86.20}:8095:8095"
+    environment:
+      SOURCE_MODE: "mqtt"
+      MQTT_BROKER_HOST: "${MQTT_BROKER_HOST:-192.168.86.7}"
+      MQTT_BROKER_PORT: "${MQTT_BROKER_PORT:-1883}"
+      MQTT_USERNAME: "${MQTT_USERNAME:?set MQTT_USERNAME}"
+      MQTT_PASSWORD_FILE: "/run/secrets/mqtt_password"
+      # Empty on purpose. Unset would fall back to neurio/raw. Current
+      # firmware publishes no raw feed, so this deployment is hourly-only.
+      MQTT_RAW_TOPIC: ""
+      MQTT_HOURLY_TOPIC: "neurio/hourly/energy"
+      MQTT_ACK_TOPIC: "neurio/hourly/ack"
+      NEURIO_HOURLY_STALE_AFTER_SECONDS: "${NEURIO_HOURLY_STALE_AFTER_SECONDS:-3900}"
+      BIND_ADDRESS: "0.0.0.0"
+      BIND_PORT: "8095"
+      ALLOW_CONTAINER_WILDCARD_BIND: "host-publish-pinned"
+      DATA_DIR: "/data"
+      NEURIO_POLL_INTERVAL_SECONDS: "15"
+      NEURIO_POLL_TIMEOUT_SECONDS: "3"
+      NEURIO_POLL_MAX_BACKOFF_SECONDS: "300"
+      NEURIO_TIMEZONE: "America/Chicago"
+      NEURIO_TOPOLOGY_VERIFIED: "false"
+      NEURIO_CONSUMPTION_SOURCE: "consumption_channel"
+      NEURIO_REDACT_IDENTITY: "true"
+      NEURIO_RAW_RETENTION_DAYS: "0"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/healthz', timeout=2).read()",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+secrets:
+  mqtt_password:
+    file: ${MQTT_PASSWORD_HOST_FILE:-/srv/neurio-recorder/mqtt_password}

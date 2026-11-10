@@ -14,7 +14,7 @@ Home Assistant mode requires `HA_URL`, `HA_ENTITY`, and either `HA_TOKEN_FILE` o
 
 ## Health
 
-`/healthz` answers when the process is up. `/readyz` answers when the database can be read. A stale or unreachable source does not fail readiness, and it does not by itself restart the container. `/api/v1/status` reports `device_fresh` separately from `process_ok` and `db_ok`.
+`/healthz` answers when the process is up. `/readyz` answers when the database can be read. A stale or unreachable source does not fail readiness, and it does not by itself restart the container. `/api/v1/status` reports `device_fresh` separately from `process_ok` and `db_ok`. Device mode, Home Assistant mode, and MQTT mode with a raw topic compare the last raw-sample success with `NEURIO_STALE_AFTER_SECONDS` (default 60). Hourly-only MQTT mode (`MQTT_RAW_TOPIC` empty) compares the last hourly message with `NEURIO_HOURLY_STALE_AFTER_SECONDS` (default 3900).
 
 The status payload repeats a November 6, 2026 recorder snapshot as historical context: last valid net at `2026-11-06T19:30:50-06:00`, unavailable at `2026-11-06T19:31:06-06:00`. Those times are not a measurement taken by this process. Static fields such as `docker_image_built` and `deployed` are not updated from the environment.
 

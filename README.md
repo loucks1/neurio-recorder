@@ -74,7 +74,8 @@ There is no default bind address and no default device URL. `check-config` exits
 | `NEURIO_POLL_TIMEOUT_SECONDS` | no | Default 3. Must be shorter than the interval in device and relay modes. In mqtt mode it is the MQTT socket timeout: greater than 0 and at most 120 |
 | `NEURIO_POLL_MAX_BACKOFF_SECONDS` | no | Default 300 |
 | `NEURIO_POLL_JITTER_RATIO` | no | Default 0.2 |
-| `NEURIO_STALE_AFTER_SECONDS` | no | Default 60. Staleness does not fail `/readyz` |
+| `NEURIO_STALE_AFTER_SECONDS` | no | Default 60. `device_fresh` in device mode, Home Assistant mode, and MQTT mode when `MQTT_RAW_TOPIC` is set. Staleness does not fail `/readyz` |
+| `NEURIO_HOURLY_STALE_AFTER_SECONDS` | no | Default 3900 (one hour plus five minutes). `device_fresh` only when `SOURCE_MODE=mqtt` and `MQTT_RAW_TOPIC` is empty. The age is the last hourly message |
 | `NEURIO_MAX_ALLOCATABLE_GAP_SECONDS` | no | Default 45 |
 
 Device-mode local run:
@@ -107,11 +108,17 @@ PYTHONPATH=src python3 -m neurio_collector
 
 On a broker that requires a login, also set `MQTT_USERNAME` and `MQTT_PASSWORD_FILE`. The recorder subscribes to the raw topic at QoS 0 (unless disabled with an empty `MQTT_RAW_TOPIC`) and the hourly topic at QoS 1, and reconnects with backoff when the broker drops the connection. `/api/v1/status` reports the two feeds separately under `mqtt_relay` — message counts and last-message times for each — so a silent raw feed is visible rather than masked by hourly traffic.
 
+When `MQTT_RAW_TOPIC` is empty, `device_fresh` on `/api/v1/status` and `/api/v1/latest` follows the last hourly message. A running process uses the poller's `last_hourly_message_at`. If this process has not seen an hourly message yet, including just after a restart, it uses the newest `hourly_records.received_at_utc`. The threshold is `NEURIO_HOURLY_STALE_AFTER_SECONDS` (default 3900). `staleness_threshold_seconds` in the status payload reports that value. Device mode, Home Assistant mode, and MQTT mode with a raw topic keep `NEURIO_STALE_AFTER_SECONDS` (default 60) and do not consult the hourly clock.
+
 `/healthz` is process liveness. `/readyz` is database readiness and stays up when the source is stale. `GET /api/v1/status` reports `device_fresh` separately. Other routes: `/api/v1/latest`, `/api/v1/channels`, `/api/v1/samples`, `/api/v1/spans`, `/api/v1/energy`, `/api/v1/hourly` (the MQTT hourly records, with their acknowledgement times; `/api/v1/status` also counts and summarizes them), and `/api/v1/export/`. The API is GET-only.
 
 ## Deploy with Docker Compose
 
-The image has no pip install. Runtime code is the Python 3.12 standard library.
+The image installs one pinned package, paho-mqtt, at build time. Everything else at runtime is the Python 3.12 standard library.
+
+`compose.yml` is the Home Assistant deployment. `compose.mqtt.yml` is a separate file for hourly-only MQTT mode. Use one of them. Do not pass both `-f` files together.
+
+### Home Assistant
 
 1. Create the data and backup directories and give uid 10001 write access (`chown 10001:10001`, mode such as `0750`).
 2. Create the token file, mode `0600`, containing only the long-lived Home Assistant token. Compose mounts it read-only at `/run/secrets/ha_token`.
@@ -129,7 +136,32 @@ Plain HTTP to a literal RFC1918 Home Assistant address is rejected unless `HA_AL
 
 For device mode, drop the secret, set `SOURCE_MODE=device` and `NEURIO_URL`, and do not set the Home Assistant variables.
 
-The shipped `compose.yml` stays the Home Assistant variant; there is no Compose example for MQTT mode. To run MQTT mode in a container, adapt the service environment: drop the `ha_token` secret and the `HA_*` variables, and set `SOURCE_MODE=mqtt` with `MQTT_BROKER_HOST` (plus `MQTT_USERNAME` and a password file if the broker requires a login).
+### MQTT
+
+`compose.mqtt.yml` runs the same image against the ESPHome bridge's hourly topics. It sets `SOURCE_MODE=mqtt`, leaves `MQTT_RAW_TOPIC` empty, sets `MQTT_HOURLY_TOPIC=neurio/hourly/energy` and `MQTT_ACK_TOPIC=neurio/hourly/ack`, and does not set `NEURIO_URL` or any `HA_*` variable. It does not mount the `ha_token` secret.
+
+Broker host and port come from the environment, defaulting to `192.168.86.7` and `1883`. `MQTT_USERNAME` is required. The broker password is the Compose file secret `mqtt_password`: the host file `MQTT_PASSWORD_HOST_FILE` (default `/srv/neurio-recorder/mqtt_password`) is mounted read-only at `/run/secrets/mqtt_password`, and the process reads it through `MQTT_PASSWORD_FILE`. The password is not stored in this repository, in `compose.mqtt.yml`, or in `.env`.
+
+Both Compose files use the project name `neurio-lan-collector`. Starting the MQTT file recreates that service. If this host already has a collector database, back it up before that. No schema migration is required: `hourly_records` already exists.
+
+1. Back up the existing database. From the running Home Assistant container, or any process that can see the files:
+
+```sh
+docker compose exec -T neurio-recorder python3 -m neurio_collector backup --db /data/neurio.sqlite --dest /backups/neurio-YYYYmmddTHHMMSSZ.sqlite
+docker compose exec -T neurio-recorder python3 -m neurio_collector verify-backup --src /backups/neurio-YYYYmmddTHHMMSSZ.sqlite
+```
+
+2. Create the data and backup directories if they are not already there, and give uid 10001 write access (`chown 10001:10001`, mode such as `0750`).
+3. Create the password file, mode `0600`, containing only the broker password. The default path is `/srv/neurio-recorder/mqtt_password`.
+4. In `.env`, set `PUBLISH_ADDRESS` to the host address that should publish port 8095, and set `MQTT_USERNAME`. Set `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT`, `MQTT_PASSWORD_HOST_FILE`, or `NEURIO_HOURLY_STALE_AFTER_SECONDS` only to override the defaults (`192.168.86.7`, `1883`, `/srv/neurio-recorder/mqtt_password`, `3900`).
+5. Build and start with the MQTT file alone:
+
+```sh
+docker compose -f compose.mqtt.yml up -d --build
+docker compose -f compose.mqtt.yml exec -T neurio-recorder python3 -m neurio_collector check-config
+```
+
+The container has the same read-only root, dropped capabilities, `no-new-privileges`, and memory and CPU limits as the Home Assistant file. `/healthz` still means the process is up. `device_fresh` in this mode is the hourly-message check described above.
 
 ## Backup and restore
 
