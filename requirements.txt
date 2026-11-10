@@ -1,0 +1,3 @@
+# Runtime dependencies: none.
+# neurio-lan-collector uses the Python 3.12 standard library only.
+# The Docker image does not run pip.

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.pre-restore
+uploads/
+agent-tools/
+dist/
+.env
+ha_token

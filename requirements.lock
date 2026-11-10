@@ -1,0 +1,7 @@
+# neurio-lan-collector lock
+# format: none-v1
+# python_requires: >=3.12
+# third_party_distributions: 0
+# installer: not required
+# image: python:3.12-slim
+# lock_note: pyproject.toml declares no dependencies. Do not pip install the host environment into the image.

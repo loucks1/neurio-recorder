@@ -1,0 +1,13 @@
+# Example daily timer. Copy to /etc/systemd/system/, then:
+#   systemctl daemon-reload
+#   systemctl enable --now neurio-recorder-backup.timer
+
+[Unit]
+Description=Daily online backup of the Neurio recorder database
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,62 @@
+{
+  "_provenance": {
+    "kind": "ha_recorder_channel_attributes",
+    "not_a_live_current_sample": true,
+    "not_a_complete_physical_payload": true,
+    "not_a_device_timestamp": true,
+    "source": "Home Assistant recorder history for sensor.neurio_raw",
+    "recovered_from": "Narrow history query beginning 2026-11-06 20:29 America/New_York. The row is a query-boundary state, not a device measurement timestamp.",
+    "last_valid_net_chicago": "2026-11-06T19:30:50-06:00",
+    "became_unavailable_chicago": "2026-11-06T19:31:06-06:00",
+    "missing_fields": ["sensorId", "timestamp", "cts"],
+    "endpoint_not_included": true,
+    "note": "Real observed channel attributes. The feed had been reporting and then became unavailable at the time above. This file is not a current live test."
+  },
+  "channels": [
+    {
+      "type": "PHASE_A_CONSUMPTION",
+      "ch": 1,
+      "eImp_Ws": 373862072453,
+      "eExp_Ws": 2026661,
+      "p_W": 586,
+      "q_VAR": -150,
+      "v_V": 124.149
+    },
+    {
+      "type": "PHASE_B_CONSUMPTION",
+      "ch": 2,
+      "eImp_Ws": 252460116874,
+      "eExp_Ws": 36215164,
+      "p_W": 153,
+      "q_VAR": -180,
+      "v_V": 124.49
+    },
+    {
+      "type": "NET",
+      "ch": 3,
+      "eImp_Ws": 445392613666,
+      "eExp_Ws": 236251294077,
+      "p_W": 738,
+      "q_VAR": -340,
+      "v_V": 124.325
+    },
+    {
+      "type": "GENERATION",
+      "ch": 4,
+      "eImp_Ws": 417287992434,
+      "eExp_Ws": 145362402,
+      "p_W": 0,
+      "q_VAR": 11,
+      "v_V": 124.313
+    },
+    {
+      "type": "CONSUMPTION",
+      "ch": 5,
+      "eImp_Ws": 626227269168,
+      "eExp_Ws": 0,
+      "p_W": 739,
+      "q_VAR": -329,
+      "v_V": 124.319
+    }
+  ]
+}

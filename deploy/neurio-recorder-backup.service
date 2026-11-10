@@ -1,0 +1,13 @@
+# Example oneshot. Copy to /etc/systemd/system/ and edit the paths.
+# The account that runs this unit must be allowed to `docker compose exec`.
+# The script refuses to delete older backups.
+
+[Unit]
+Description=Online backup of the Neurio recorder SQLite database
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/neurio-recorder
+Environment=NEURIO_BACKUP_ROOT=/srv/neurio-recorder
+Environment=NEURIO_COMPOSE_FILE=/srv/neurio-recorder/compose.yml
+ExecStart=/usr/bin/python3 /srv/neurio-recorder/online-backup.py

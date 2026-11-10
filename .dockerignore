@@ -1,0 +1,12 @@
+.git
+tests
+docs
+deploy
+uploads
+agent-tools
+.env
+ha_token
+**/__pycache__
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
