@@ -40,6 +40,7 @@ def ingest_body(
     cfg: Config,
     http_status: int | None = None,
     poll_latency_ms: int | None = None,
+    source_kind: str = "device",
 ) -> IngestResult:
     try:
         parsed = parse_payload(body)
@@ -48,7 +49,9 @@ def ingest_body(
     raw_text = body.decode("utf-8")
     with db.write_lock:
         with db.transaction():
-            return _apply(db, parsed, raw_text, received_at, cfg, http_status, poll_latency_ms)
+            return _apply(
+                db, parsed, raw_text, received_at, cfg, http_status, poll_latency_ms, source_kind
+            )
 
 
 def _apply(
@@ -59,6 +62,7 @@ def _apply(
     cfg: Config,
     http_status: int | None,
     poll_latency_ms: int | None,
+    source_kind: str = "device",
 ) -> IngestResult:
     conn = db.conn
     received_s = format_utc(received_at)
@@ -92,6 +96,7 @@ def _apply(
         http_status,
         poll_latency_ms,
         applied,
+        {"source_kind": source_kind},
     )
     spans = 0
     for channel in parsed.channels:

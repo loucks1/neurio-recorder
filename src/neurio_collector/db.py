@@ -124,6 +124,22 @@ CREATE TABLE IF NOT EXISTS poll_attempts (
   sample_id INTEGER,
   backoff_seconds REAL
 );
+CREATE TABLE IF NOT EXISTS hourly_records (
+  record_id INTEGER PRIMARY KEY,
+  device_timestamp_raw TEXT,
+  device_timestamp_utc TEXT,
+  retries INTEGER NOT NULL DEFAULT 0,
+  received_at_utc TEXT NOT NULL,
+  raw_json TEXT NOT NULL,
+  net_import_millikwh INTEGER,
+  net_export_millikwh INTEGER,
+  net_delta_net_millikwh INTEGER,
+  generation_delta_export_millikwh INTEGER,
+  consumption_delta_import_millikwh INTEGER,
+  phase_a_delta_import_millikwh INTEGER,
+  phase_b_delta_import_millikwh INTEGER,
+  acked_at_utc TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_samples_sensor ON samples(sensor_pk, id);
 CREATE INDEX IF NOT EXISTS idx_samples_hash ON samples(sensor_pk, payload_sha256);
 CREATE INDEX IF NOT EXISTS idx_samples_received ON samples(received_at_utc);
