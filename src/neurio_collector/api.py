@@ -25,6 +25,7 @@ from .observed import (
 from .poller import FRESH_OUTCOMES
 from .rpt_contract import contract_flags
 from .timeutil import format_utc, parse_instant, utcnow
+from .units import ws_to_kwh_str
 
 MAX_LIMIT = 1000
 
@@ -91,6 +92,8 @@ def dispatch(path: str, cfg: Config, db, poller, now: datetime | None = None):
             return 200, list_spans(cfg, db, query), "json"
         if route == "/api/v1/energy":
             return 200, _energy(db, cfg, query), "json"
+        if route == "/api/v1/hourly":
+            return 200, list_hourly_records(cfg, db, query), "json"
         if route == "/api/v1/export/samples.csv":
             return 200, samples_csv(cfg, db, query), "csv"
         if route == "/api/v1/export/spans.csv":
@@ -111,7 +114,14 @@ def dispatch(path: str, cfg: Config, db, poller, now: datetime | None = None):
 def build_status(cfg: Config, db, poller, now: datetime) -> dict:
     db_ok = True
     schema = None
-    counts = {"samples": None, "spans": None, "channels": None}
+    counts = {"samples": None, "spans": None, "channels": None, "hourly_records": None}
+    hourly = {
+        "stored": None,
+        "acked": None,
+        "last_record_id": None,
+        "last_received_at_utc": None,
+        "last_acked_at_utc": None,
+    }
     last_poll = None
     try:
         reader = db.reader()
@@ -124,6 +134,22 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
                 "samples": reader.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"],
                 "spans": reader.execute("SELECT COUNT(*) AS n FROM energy_spans").fetchone()["n"],
                 "channels": reader.execute("SELECT COUNT(*) AS n FROM channels").fetchone()["n"],
+                "hourly_records": reader.execute(
+                    "SELECT COUNT(*) AS n FROM hourly_records"
+                ).fetchone()["n"],
+            }
+            agg = reader.execute(
+                "SELECT COUNT(*) AS stored, "
+                "SUM(CASE WHEN acked_at_utc IS NOT NULL THEN 1 ELSE 0 END) AS acked, "
+                "MAX(record_id) AS last_id, MAX(received_at_utc) AS last_received, "
+                "MAX(acked_at_utc) AS last_acked FROM hourly_records"
+            ).fetchone()
+            hourly = {
+                "stored": agg["stored"],
+                "acked": agg["acked"] or 0,
+                "last_record_id": agg["last_id"],
+                "last_received_at_utc": agg["last_received"],
+                "last_acked_at_utc": agg["last_acked"],
             }
             last_poll = reader.execute(
                 "SELECT outcome, finished_at_utc, error, http_status FROM poll_attempts "
@@ -186,6 +212,7 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
             "token_configured": cfg.ha_token is not None,
             "device_timestamp": "unknown",
         },
+        "hourly_records": hourly,
         "mqtt_relay": None if cfg.source_mode != "mqtt" else {
             "broker_host": cfg.mqtt_broker_host,
             "broker_port": cfg.mqtt_broker_port,
@@ -329,6 +356,60 @@ def list_spans(cfg: Config, db, query: dict) -> dict:
     for row in rows:
         spans.append(_public_span(row, cfg))
     return {"spans": spans, "next_cursor": None if not more else str(rows[-1]["id"])}
+
+
+def _millikwh_str(value) -> str | None:
+    if value is None:
+        return None
+    return ws_to_kwh_str(value * 3600)
+
+
+def list_hourly_records(cfg: Config, db, query: dict) -> dict:
+    limit, cursor = _page(query)
+    reader = db.reader()
+    try:
+        rows = [
+            dict(row)
+            for row in reader.execute(
+                "SELECT record_id, device_timestamp_raw, device_timestamp_utc, retries, "
+                "received_at_utc, acked_at_utc, net_import_millikwh, net_export_millikwh, "
+                "net_delta_net_millikwh, generation_delta_export_millikwh, "
+                "consumption_delta_import_millikwh, phase_a_delta_import_millikwh, "
+                "phase_b_delta_import_millikwh FROM hourly_records "
+                "WHERE record_id>? ORDER BY record_id LIMIT ?",
+                (cursor, limit + 1),
+            ).fetchall()
+        ]
+    finally:
+        reader.close()
+    more = len(rows) > limit
+    rows = rows[:limit]
+    records = [
+        {
+            "record_id": row["record_id"],
+            "device_timestamp_raw": row["device_timestamp_raw"],
+            "device_timestamp_utc": row["device_timestamp_utc"],
+            "retries": row["retries"],
+            "received_at_utc": row["received_at_utc"],
+            "acked_at_utc": row["acked_at_utc"],
+            "net_import_kwh": _millikwh_str(row["net_import_millikwh"]),
+            "net_export_kwh": _millikwh_str(row["net_export_millikwh"]),
+            "net_delta_net_kwh": _millikwh_str(row["net_delta_net_millikwh"]),
+            "generation_delta_export_kwh": _millikwh_str(
+                row["generation_delta_export_millikwh"]
+            ),
+            "consumption_delta_import_kwh": _millikwh_str(
+                row["consumption_delta_import_millikwh"]
+            ),
+            "phase_a_delta_import_kwh": _millikwh_str(row["phase_a_delta_import_millikwh"]),
+            "phase_b_delta_import_kwh": _millikwh_str(row["phase_b_delta_import_millikwh"]),
+        }
+        for row in rows
+    ]
+    return {
+        "hourly_records": records,
+        "next_cursor": None if not more else str(rows[-1]["record_id"]),
+    }
 
 
 def samples_csv(cfg: Config, db, query: dict) -> bytes:
