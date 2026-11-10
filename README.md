@@ -1,9 +1,12 @@
 # Neurio recorder
 
-A Python service that records a Neurio/PWRview energy monitor. It reads `current-sample` data in one of two modes:
+A Python service that records a Neurio/PWRview energy monitor. It reads `current-sample` data in one of three modes:
 
 - **Device.** HTTP GET of the monitor's LAN `current-sample` URL.
-- **Home Assistant.** HTTP GET of one entity, by default `sensor.neurio_raw`. Home Assistant may fill that entity from a LAN poll or from MQTT. This service only reads the entity state. It does not subscribe to MQTT, and it does not change Home Assistant.
+- **Home Assistant.** HTTP GET of one entity, by default `sensor.neurio_raw`. Home Assistant may fill that entity from a LAN poll or from MQTT. This service only reads the entity state, and it does not change Home Assistant.
+- **MQTT.** Subscribes to an ESPHome Neurio bridge (see `loucks1/esphome-neurio-openevse`) on a local MQTT broker. Raw samples arrive on `neurio/raw` and are stored exactly like device samples, with `source_kind` set to `mqtt_bridge`. Hourly energy records arrive on `neurio/hourly/energy` (QoS 1) and are stored in `hourly_records`. The recorder publishes the record id to `neurio/hourly/ack` only after the record is durably stored; a record that fails to parse or store is never acknowledged, so the bridge keeps it queued and republishes it. The MQTT client is paho-mqtt (see Dependencies below); packet framing, keepalive, and QoS 1 acknowledgement are paho's, not hand-rolled.
+
+Dependencies: everything in this project is the Python standard library except the MQTT client, which is paho-mqtt, pinned exactly in `requirements.txt`. MQTT is a solved protocol with sharp edges (framing, keepalive, QoS handshakes), so it is a library rather than hand-written code. The Docker image pip-installs that one package at build time; paho is imported lazily, so the device and Home Assistant modes never touch it.
 
 Readings go into SQLite. Raw JSON is kept indefinitely when `NEURIO_RAW_RETENTION_DAYS=0` (the Compose example). The read-only API serves history and CSV. Online backup uses the SQLite backup API so a copy is consistent while the collector is running.
 
@@ -24,6 +27,7 @@ SQLite is in WAL mode with `synchronous=FULL`. One process holds `DATA_DIR/colle
 | `sample_cts` | Per-CT power. Not added into household totals |
 | `counter_epochs`, `energy_spans` | Counter baselines and non-negative deltas |
 | `poll_attempts` | Poll outcomes. Aged out separately from samples |
+| `hourly_records` | MQTT mode only. One row per bridge hourly energy record: the record id, its energy values in integer milli-kWh, the raw JSON, and the time the record was acknowledged |
 
 A repeated payload hash is a duplicate and does not create another span. A counter decrease opens a new epoch and does not store a negative delta.
 
@@ -33,11 +37,11 @@ There is no default bind address and no default device URL. `check-config` exits
 
 `0.0.0.0` and `::` are refused unless `ALLOW_CONTAINER_WILDCARD_BIND=host-publish-pinned`. In Compose, pair that opt-in with a host publish address pinned to one IP. Do not publish `8095:8095`, which listens on every host address.
 
-`NEURIO_POLL_INTERVAL_SECONDS` must be from 10 to 3600. The default is 15. A 5-second interval is rejected so this process cannot match a fast Home Assistant poll.
+`NEURIO_POLL_INTERVAL_SECONDS` must be from 10 to 3600. The default is 15. A 5-second interval is rejected so this process cannot match a fast Home Assistant poll. In MQTT mode nothing is polled; the interval is only the base of the reconnect backoff and has no minimum.
 
 | Variable | Required | Role |
 |---|---|---|
-| `SOURCE_MODE` | yes | `device` or `homeassistant` |
+| `SOURCE_MODE` | yes | `device`, `homeassistant`, or `mqtt` |
 | `BIND_ADDRESS` | yes | IP address. No hostname |
 | `BIND_PORT` | yes | 1–65535 |
 | `DATA_DIR` | yes | Absolute path of the SQLite directory |
@@ -48,6 +52,17 @@ There is no default bind address and no default device URL. `check-config` exits
 | `HA_TOKEN_FILE` | relay mode | Preferred. File contents are the long-lived token. Do not also set `HA_TOKEN` |
 | `HA_TOKEN` | relay mode | Inline alternative to the file. Not for Compose |
 | `HA_ALLOW_RFC1918_HTTP` | HTTP to RFC1918 | Must be `accept-unencrypted-bearer` or the process refuses the URL |
+| `MQTT_BROKER_HOST` | mqtt mode | Broker hostname or IP address. No scheme, port, or path |
+| `MQTT_BROKER_PORT` | no | Default 1883 |
+| `MQTT_TLS` | no | Default `false`. TLS verifies against the system CA store |
+| `MQTT_USERNAME` | broker login | Must be set together with a password, or both left unset for an anonymous login |
+| `MQTT_PASSWORD_FILE` | broker login | Preferred. File contents are the broker password. Do not also set `MQTT_PASSWORD` |
+| `MQTT_PASSWORD` | broker login | Inline alternative to the file |
+| `MQTT_CLIENT_ID` | no | Default `neurio-recorder` |
+| `MQTT_RAW_TOPIC` | no | Default `neurio/raw`. Exact topic; wildcards are rejected |
+| `MQTT_HOURLY_TOPIC` | no | Default `neurio/hourly/energy`. Exact topic; wildcards are rejected |
+| `MQTT_ACK_TOPIC` | no | Default `neurio/hourly/ack`. The record id is published here as bare decimal text |
+| `MQTT_KEEPALIVE_SECONDS` | no | Default 60 |
 | `ALLOW_CONTAINER_WILDCARD_BIND` | with `0.0.0.0` | Must be `host-publish-pinned` |
 | `NEURIO_RAW_RETENTION_DAYS` | no | `0` keeps `raw_json`. A positive number clears older payloads only. **Unset means 14** |
 | `NEURIO_POLL_LOG_RETENTION_DAYS` | no | Deletes aged poll-attempt rows. Default 30. Must be at least 1 |
@@ -56,7 +71,7 @@ There is no default bind address and no default device URL. `check-config` exits
 | `NEURIO_TOPOLOGY_VERIFIED` | no | Must be `true` before `derive_net_plus_generation` is accepted. Default `false` |
 | `NEURIO_GENERATION_REGISTER` | no | `unset` (default), `e_imp`, or `e_exp` |
 | `NEURIO_REDACT_IDENTITY` | no | Default `true`. Omits sensor ids from the API and CSV |
-| `NEURIO_POLL_TIMEOUT_SECONDS` | no | Default 3. Must be shorter than the interval |
+| `NEURIO_POLL_TIMEOUT_SECONDS` | no | Default 3. Must be shorter than the interval in device and relay modes. In mqtt mode it is the MQTT socket timeout: greater than 0 and at most 120 |
 | `NEURIO_POLL_MAX_BACKOFF_SECONDS` | no | Default 300 |
 | `NEURIO_POLL_JITTER_RATIO` | no | Default 0.2 |
 | `NEURIO_STALE_AFTER_SECONDS` | no | Default 60. Staleness does not fail `/readyz` |
@@ -77,6 +92,20 @@ PYTHONPATH=src python3 -m neurio_collector
 ```
 
 Relay mode uses the same process. Leave `NEURIO_URL` unset. The process reads the token file once, sends it only as `Authorization: Bearer`, and strips it from stored payloads and error text.
+
+MQTT mode uses the same process. Leave `NEURIO_URL` and the Home Assistant variables unset:
+
+```sh
+export SOURCE_MODE=mqtt
+export BIND_ADDRESS=127.0.0.1
+export BIND_PORT=8095
+export DATA_DIR=/absolute/path/to/data
+export MQTT_BROKER_HOST=192.168.1.10
+PYTHONPATH=src python3 -m neurio_collector check-config
+PYTHONPATH=src python3 -m neurio_collector
+```
+
+On a broker that requires a login, also set `MQTT_USERNAME` and `MQTT_PASSWORD_FILE`. The recorder subscribes to the raw topic at QoS 0 and the hourly topic at QoS 1, and reconnects with backoff when the broker drops the connection.
 
 `/healthz` is process liveness. `/readyz` is database readiness and stays up when the source is stale. `GET /api/v1/status` reports `device_fresh` separately. Other routes: `/api/v1/latest`, `/api/v1/channels`, `/api/v1/samples`, `/api/v1/spans`, `/api/v1/energy`, and `/api/v1/export/`. The API is GET-only.
 
@@ -99,6 +128,8 @@ docker compose exec -T neurio-recorder python3 -m neurio_collector check-config
 Plain HTTP to a literal RFC1918 Home Assistant address is rejected unless `HA_ALLOW_RFC1918_HTTP=accept-unencrypted-bearer`. The flag does not allow DNS names, public addresses, link-local, or metadata addresses, and it does not turn off HTTPS certificate checks. Redirects are not followed. Environment proxies are not used.
 
 For device mode, drop the secret, set `SOURCE_MODE=device` and `NEURIO_URL`, and do not set the Home Assistant variables.
+
+The shipped `compose.yml` stays the Home Assistant variant; there is no Compose example for MQTT mode. To run MQTT mode in a container, adapt the service environment: drop the `ha_token` secret and the `HA_*` variables, and set `SOURCE_MODE=mqtt` with `MQTT_BROKER_HOST` (plus `MQTT_USERNAME` and a password file if the broker requires a login).
 
 ## Backup and restore
 

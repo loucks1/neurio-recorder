@@ -63,6 +63,16 @@ class Config:
     ha_source_id: str | None = None
     ha_token: Secret | None = None
     ha_allow_rfc1918_http: str | None = None
+    mqtt_broker_host: str | None = None
+    mqtt_broker_port: int = 1883
+    mqtt_tls: bool = False
+    mqtt_username: str | None = None
+    mqtt_password: Secret | None = None
+    mqtt_client_id: str = "neurio-recorder"
+    mqtt_raw_topic: str = "neurio/raw"
+    mqtt_hourly_topic: str = "neurio/hourly/energy"
+    mqtt_ack_topic: str = "neurio/hourly/ack"
+    mqtt_keepalive_seconds: int = 60
     poll_interval_seconds: float = 15.0
     poll_timeout_seconds: float = 3.0
     poll_max_backoff_seconds: float = 300.0
@@ -104,11 +114,11 @@ class Config:
         )
         if not self.data_dir or not os.path.isabs(self.data_dir):
             raise ConfigError("DATA_DIR must be an absolute path")
-        if self.source_mode not in {"device", "homeassistant"}:
-            raise ConfigError("SOURCE_MODE must be device or homeassistant")
+        if self.source_mode not in {"device", "homeassistant", "mqtt"}:
+            raise ConfigError("SOURCE_MODE must be device, homeassistant, or mqtt")
         if self.source_mode == "device":
             validate_device_url(self.neurio_url)
-        else:
+        elif self.source_mode == "homeassistant":
             validate_ha_url(self.ha_url or "", self.ha_allow_rfc1918_http)
             if not self.ha_entity or self.ha_entity.startswith("/") or " " in self.ha_entity:
                 raise ConfigError("HA_ENTITY must be an entity id such as sensor.neurio_raw")
@@ -121,7 +131,9 @@ class Config:
                     "SOURCE_MODE=homeassistant does not poll the Neurio and has no fallback. "
                     "Unset NEURIO_URL."
                 )
-        if self.poll_interval_seconds < COLLECTOR_MIN_POLL_INTERVAL_SECONDS:
+        else:
+            validate_mqtt_settings(self)
+        if self.source_mode != "mqtt" and self.poll_interval_seconds < COLLECTOR_MIN_POLL_INTERVAL_SECONDS:
             raise ConfigError(
                 "NEURIO_POLL_INTERVAL_SECONDS must be at least "
                 f"{COLLECTOR_MIN_POLL_INTERVAL_SECONDS}. Home Assistant already "
@@ -129,7 +141,13 @@ class Config:
             )
         if self.poll_interval_seconds > 3600:
             raise ConfigError("NEURIO_POLL_INTERVAL_SECONDS must be <= 3600")
-        if not 0 < self.poll_timeout_seconds < self.poll_interval_seconds:
+        if self.source_mode == "mqtt":
+            if not 0 < self.poll_timeout_seconds <= 120:
+                raise ConfigError(
+                    "NEURIO_POLL_TIMEOUT_SECONDS must be > 0 and <= 120 in mqtt mode. "
+                    "It is the MQTT socket timeout, not a poll timeout."
+                )
+        elif not 0 < self.poll_timeout_seconds < self.poll_interval_seconds:
             raise ConfigError("NEURIO_POLL_TIMEOUT_SECONDS must be > 0 and shorter than the interval")
         if self.poll_max_backoff_seconds < self.poll_interval_seconds:
             raise ConfigError("NEURIO_POLL_MAX_BACKOFF_SECONDS must be >= the poll interval")
@@ -170,6 +188,16 @@ class Config:
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
         values = os.environ if env is None else env
         source_mode = _required(values, "SOURCE_MODE")
+        mqtt_broker_host: str | None = None
+        mqtt_broker_port = 1883
+        mqtt_tls = False
+        mqtt_username: str | None = None
+        mqtt_password: Secret | None = None
+        mqtt_client_id = "neurio-recorder"
+        mqtt_raw_topic = "neurio/raw"
+        mqtt_hourly_topic = "neurio/hourly/energy"
+        mqtt_ack_topic = "neurio/hourly/ack"
+        mqtt_keepalive_seconds = 60
         if source_mode == "homeassistant":
             if (values.get("NEURIO_URL") or "").strip():
                 raise ConfigError(
@@ -191,8 +219,34 @@ class Config:
             ha_allow_rfc1918_http = None
             if _optional_blank(values, "HA_TOKEN") or _optional_blank(values, "HA_TOKEN_FILE"):
                 raise ConfigError("HA_TOKEN is only read when SOURCE_MODE=homeassistant")
+        elif source_mode == "mqtt":
+            if (values.get("NEURIO_URL") or "").strip():
+                raise ConfigError(
+                    "SOURCE_MODE=mqtt does not poll the Neurio directly. "
+                    "Unset NEURIO_URL."
+                )
+            neurio_url = ""
+            ha_url = None
+            ha_entity = None
+            ha_source_id = None
+            ha_token = None
+            ha_allow_rfc1918_http = None
+            if _optional_blank(values, "HA_TOKEN") or _optional_blank(values, "HA_TOKEN_FILE"):
+                raise ConfigError("HA_TOKEN is only read when SOURCE_MODE=homeassistant")
+            mqtt_broker_host = _required(values, "MQTT_BROKER_HOST")
+            mqtt_broker_port = _optional_int(values, "MQTT_BROKER_PORT", 1883)
+            mqtt_tls = _optional_bool(values, "MQTT_TLS", False)
+            mqtt_username = _optional_blank(values, "MQTT_USERNAME")
+            mqtt_password = _read_secret(values, "MQTT_PASSWORD_FILE", "MQTT_PASSWORD")
+            mqtt_client_id = _optional_str(values, "MQTT_CLIENT_ID", "neurio-recorder")
+            mqtt_raw_topic = _optional_str(values, "MQTT_RAW_TOPIC", "neurio/raw")
+            mqtt_hourly_topic = _optional_str(
+                values, "MQTT_HOURLY_TOPIC", "neurio/hourly/energy"
+            )
+            mqtt_ack_topic = _optional_str(values, "MQTT_ACK_TOPIC", "neurio/hourly/ack")
+            mqtt_keepalive_seconds = _optional_int(values, "MQTT_KEEPALIVE_SECONDS", 60)
         else:
-            raise ConfigError("SOURCE_MODE must be device or homeassistant")
+            raise ConfigError("SOURCE_MODE must be device, homeassistant, or mqtt")
         cfg = cls(
             bind_address=_required(values, "BIND_ADDRESS"),
             bind_port=_required_int(values, "BIND_PORT"),
@@ -204,6 +258,16 @@ class Config:
             ha_source_id=ha_source_id,
             ha_token=ha_token,
             ha_allow_rfc1918_http=ha_allow_rfc1918_http,
+            mqtt_broker_host=mqtt_broker_host,
+            mqtt_broker_port=mqtt_broker_port,
+            mqtt_tls=mqtt_tls,
+            mqtt_username=mqtt_username,
+            mqtt_password=mqtt_password,
+            mqtt_client_id=mqtt_client_id,
+            mqtt_raw_topic=mqtt_raw_topic,
+            mqtt_hourly_topic=mqtt_hourly_topic,
+            mqtt_ack_topic=mqtt_ack_topic,
+            mqtt_keepalive_seconds=mqtt_keepalive_seconds,
             poll_interval_seconds=_optional_float(values, "NEURIO_POLL_INTERVAL_SECONDS", 15.0),
             poll_timeout_seconds=_optional_float(values, "NEURIO_POLL_TIMEOUT_SECONDS", 3.0),
             poll_max_backoff_seconds=_optional_float(values, "NEURIO_POLL_MAX_BACKOFF_SECONDS", 300.0),
@@ -281,24 +345,87 @@ def validate_ha_url(url: str, allow_rfc1918_http: str | None = None) -> None:
     )
 
 
-def _load_ha_token(env: dict[str, str]) -> Secret:
-    file_name = (env.get("HA_TOKEN_FILE") or "").strip()
-    inline = (env.get("HA_TOKEN") or "").strip()
+def _read_secret(env: dict[str, str], file_key: str, inline_key: str) -> Secret | None:
+    """A secret from a file key or an inline key. None when neither carries a value."""
+    file_name = (env.get(file_key) or "").strip()
+    inline = (env.get(inline_key) or "").strip()
     if file_name and inline:
-        raise ConfigError("set HA_TOKEN_FILE or HA_TOKEN, not both")
-    if "HA_TOKEN" in env and "HA_TOKEN_FILE" in env and not file_name and not inline:
-        raise ConfigError("HA_TOKEN and HA_TOKEN_FILE are both empty")
+        raise ConfigError(f"set {file_key} or {inline_key}, not both")
+    if file_key in env and inline_key in env and not file_name and not inline:
+        raise ConfigError(f"{inline_key} and {file_key} are both empty")
     if file_name:
         try:
             value = Path(file_name).read_text(encoding="utf-8").strip()
         except OSError as exc:
-            raise ConfigError("HA_TOKEN_FILE could not be read") from exc
+            raise ConfigError(f"{file_key} could not be read") from exc
         if not value:
-            raise ConfigError("HA_TOKEN_FILE is empty")
+            raise ConfigError(f"{file_key} is empty")
         return Secret(value)
     if inline:
         return Secret(inline)
-    raise ConfigError("homeassistant mode requires HA_TOKEN_FILE or HA_TOKEN. The value is not requested here.")
+    return None
+
+
+def _load_ha_token(env: dict[str, str]) -> Secret:
+    secret = _read_secret(env, "HA_TOKEN_FILE", "HA_TOKEN")
+    if secret is None:
+        raise ConfigError(
+            "homeassistant mode requires HA_TOKEN_FILE or HA_TOKEN. "
+            "The value is not requested here."
+        )
+    return secret
+
+
+def validate_mqtt_settings(cfg: "Config") -> None:
+    host = cfg.mqtt_broker_host
+    if not host or not host.strip():
+        raise ConfigError("SOURCE_MODE=mqtt requires MQTT_BROKER_HOST. There is no default.")
+    host = host.strip()
+    if "://" in host or "/" in host or ":" in host or any(ch.isspace() for ch in host):
+        raise ConfigError(
+            "MQTT_BROKER_HOST must be a hostname or IP address, not a URL. "
+            "Set the port with MQTT_BROKER_PORT."
+        )
+    port = cfg.mqtt_broker_port
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ConfigError("MQTT_BROKER_PORT must be an integer from 1 to 65535")
+    if cfg.neurio_url:
+        raise ConfigError(
+            "SOURCE_MODE=mqtt does not poll the Neurio directly. Unset NEURIO_URL."
+        )
+    if not cfg.mqtt_client_id or not cfg.mqtt_client_id.strip():
+        raise ConfigError("MQTT_CLIENT_ID must not be empty")
+    for name, topic in (
+        ("MQTT_RAW_TOPIC", cfg.mqtt_raw_topic),
+        ("MQTT_HOURLY_TOPIC", cfg.mqtt_hourly_topic),
+        ("MQTT_ACK_TOPIC", cfg.mqtt_ack_topic),
+    ):
+        if not topic or not topic.strip():
+            raise ConfigError(f"{name} must not be empty")
+        if "+" in topic or "#" in topic:
+            raise ConfigError(
+                f"{name} must be an exact topic. Wildcards (+, #) are not accepted."
+            )
+    has_username = bool(cfg.mqtt_username and cfg.mqtt_username.strip())
+    has_password = cfg.mqtt_password is not None and bool(cfg.mqtt_password.reveal())
+    if has_username and not has_password:
+        raise ConfigError(
+            "MQTT_USERNAME is set but no MQTT password is configured. "
+            "Set MQTT_PASSWORD_FILE or MQTT_PASSWORD, or unset MQTT_USERNAME."
+        )
+    if has_password and not has_username:
+        raise ConfigError(
+            "An MQTT password is configured but MQTT_USERNAME is not set. "
+            "Set both, or neither for an anonymous broker login."
+        )
+    keepalive = cfg.mqtt_keepalive_seconds
+    if not isinstance(keepalive, int) or isinstance(keepalive, bool) or not 0 <= keepalive <= 65535:
+        raise ConfigError("MQTT_KEEPALIVE_SECONDS must be an integer from 0 to 65535")
+    if cfg.poll_interval_seconds <= 0:
+        raise ConfigError(
+            "NEURIO_POLL_INTERVAL_SECONDS must be positive in mqtt mode. "
+            "It is the base of the reconnect backoff."
+        )
 
 
 def validate_device_url(url: str) -> None:

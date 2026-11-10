@@ -1,7 +1,9 @@
 # neurio-lan-collector lock
-# format: none-v1
+# format: pip-v1
 # python_requires: >=3.12
-# third_party_distributions: 0
-# installer: not required
+# third_party_distributions: 1
+# installer: pip install --no-cache-dir -r requirements.txt
 # image: python:3.12-slim
-# lock_note: pyproject.toml declares no dependencies. Do not pip install the host environment into the image.
+# lock_note: pyproject.toml declares one dependency, paho-mqtt, pinned exactly
+# here and in requirements.txt. The image installs only this file's contents.
+paho-mqtt==2.2.0

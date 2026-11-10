@@ -1,5 +1,5 @@
-# No pip install. Runtime dependencies are the Python 3.12 standard library.
-# See requirements.lock.
+# One pinned runtime dependency (paho-mqtt), installed from requirements.txt.
+# Everything else is the Python 3.12 standard library. See requirements.lock.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -13,6 +13,8 @@ RUN groupadd --gid 10001 neurio \
     && chown 10001:10001 /data
 
 WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY src /app/src
 
 USER 10001:10001
