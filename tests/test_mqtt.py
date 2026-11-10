@@ -8,6 +8,7 @@ import unittest
 import support
 from neurio_collector.config import Config, ConfigError
 from neurio_collector.ingest import ingest_body
+from neurio_collector.api import dispatch
 from neurio_collector.mqtt_client import MqttClient, MqttError, MqttMessage
 from neurio_collector.mqtt_ingest import mark_hourly_acked, store_hourly_record
 from neurio_collector.poller import Poller
@@ -523,6 +524,83 @@ class MqttPollerTests(unittest.TestCase):
         self.assertEqual(fake.published, [])
         count = db.conn.execute("SELECT COUNT(*) AS n FROM hourly_records").fetchone()["n"]
         self.assertEqual(count, 0)
+
+
+class HourlyApiTests(unittest.TestCase):
+    def _cfg_for(self, db):
+        return mqtt_config(data_dir=db.path.rsplit("/", 1)[0])
+
+    def _seed(self, db, cfg):
+        first = store_hourly_record(db, hourly_body(), RECEIVED, cfg)
+        second_id = HOURLY_ID + 3600
+        body = json.loads(hourly_body())
+        body["id"] = second_id
+        body["net"]["delta_net_kwh"] = -0.25
+        second = store_hourly_record(
+            db, json.dumps(body).encode(), RECEIVED, cfg
+        )
+        self.assertEqual(first.outcome, "stored")
+        self.assertEqual(second.outcome, "stored")
+        mark_hourly_acked(db, HOURLY_ID, RECEIVED)
+        return second_id
+
+    def test_status_counts_and_summarizes_hourly_records(self):
+        db = support.open_db(self)
+        cfg = self._cfg_for(db)
+        second_id = self._seed(db, cfg)
+        status, body, _ = dispatch("/api/v1/status", cfg, db, None)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["counts"]["hourly_records"], 2)
+        summary = body["hourly_records"]
+        self.assertEqual(summary["stored"], 2)
+        self.assertEqual(summary["acked"], 1)
+        self.assertEqual(summary["last_record_id"], second_id)
+        self.assertIsNotNone(summary["last_received_at_utc"])
+        self.assertIsNotNone(summary["last_acked_at_utc"])
+
+    def test_hourly_endpoint_lists_records_with_kwh_strings(self):
+        db = support.open_db(self)
+        cfg = self._cfg_for(db)
+        second_id = self._seed(db, cfg)
+        status, body, _ = dispatch("/api/v1/hourly", cfg, db, None)
+        self.assertEqual(status, 200)
+        records = body["hourly_records"]
+        self.assertEqual([r["record_id"] for r in records], [HOURLY_ID, second_id])
+        self.assertEqual(records[0]["net_delta_net_kwh"], "0.5")
+        self.assertEqual(records[0]["net_import_kwh"], "1234.567")
+        self.assertEqual(records[1]["net_delta_net_kwh"], "-0.25")
+        self.assertIsNotNone(records[0]["acked_at_utc"])
+        self.assertIsNone(records[1]["acked_at_utc"])
+        self.assertIsNone(body["next_cursor"])
+
+    def test_hourly_endpoint_paginates_by_record_id(self):
+        db = support.open_db(self)
+        cfg = self._cfg_for(db)
+        second_id = self._seed(db, cfg)
+        status, page1, _ = dispatch("/api/v1/hourly?limit=1", cfg, db, None)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(page1["hourly_records"]), 1)
+        self.assertEqual(page1["next_cursor"], str(HOURLY_ID))
+        status, page2, _ = dispatch(
+            f"/api/v1/hourly?limit=1&cursor={page1['next_cursor']}", cfg, db, None
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [r["record_id"] for r in page2["hourly_records"]], [second_id]
+        )
+        self.assertIsNone(page2["next_cursor"])
+
+    def test_hourly_empty_database(self):
+        db = support.open_db(self)
+        cfg = self._cfg_for(db)
+        status, body, _ = dispatch("/api/v1/hourly", cfg, db, None)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["hourly_records"], [])
+        status, body, _ = dispatch("/api/v1/status", cfg, db, None)
+        self.assertEqual(body["counts"]["hourly_records"], 0)
+        self.assertEqual(body["hourly_records"]["stored"], 0)
+        self.assertEqual(body["hourly_records"]["acked"], 0)
+        self.assertIsNone(body["hourly_records"]["last_record_id"])
 
 
 if __name__ == "__main__":

@@ -107,7 +107,7 @@ PYTHONPATH=src python3 -m neurio_collector
 
 On a broker that requires a login, also set `MQTT_USERNAME` and `MQTT_PASSWORD_FILE`. The recorder subscribes to the raw topic at QoS 0 and the hourly topic at QoS 1, and reconnects with backoff when the broker drops the connection.
 
-`/healthz` is process liveness. `/readyz` is database readiness and stays up when the source is stale. `GET /api/v1/status` reports `device_fresh` separately. Other routes: `/api/v1/latest`, `/api/v1/channels`, `/api/v1/samples`, `/api/v1/spans`, `/api/v1/energy`, and `/api/v1/export/`. The API is GET-only.
+`/healthz` is process liveness. `/readyz` is database readiness and stays up when the source is stale. `GET /api/v1/status` reports `device_fresh` separately. Other routes: `/api/v1/latest`, `/api/v1/channels`, `/api/v1/samples`, `/api/v1/spans`, `/api/v1/energy`, `/api/v1/hourly` (the MQTT hourly records, with their acknowledgement times; `/api/v1/status` also counts and summarizes them), and `/api/v1/export/`. The API is GET-only.
 
 ## Deploy with Docker Compose
 
