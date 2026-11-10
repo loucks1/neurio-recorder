@@ -79,6 +79,7 @@ class Config:
     poll_jitter_ratio: float = 0.2
     poll_min_gap_seconds: float = 1.0
     stale_after_seconds: float = 60.0
+    hourly_stale_after_seconds: float = 3900.0
     sample_stale_skew_seconds: float = 180.0
     device_ahead_skew_seconds: float = 30.0
     max_allocatable_gap_seconds: float = 45.0
@@ -155,7 +156,11 @@ class Config:
             raise ConfigError("NEURIO_POLL_JITTER_RATIO must be between 0 and 1")
         if self.poll_min_gap_seconds < 0:
             raise ConfigError("NEURIO_POLL_MIN_GAP_SECONDS must be >= 0")
-        if self.stale_after_seconds <= 0 or self.sample_stale_skew_seconds <= 0:
+        if (
+            self.stale_after_seconds <= 0
+            or self.hourly_stale_after_seconds <= 0
+            or self.sample_stale_skew_seconds <= 0
+        ):
             raise ConfigError("staleness thresholds must be positive")
         if self.max_allocatable_gap_seconds <= 0:
             raise ConfigError("NEURIO_MAX_ALLOCATABLE_GAP_SECONDS must be positive")
@@ -282,6 +287,9 @@ class Config:
             poll_jitter_ratio=_optional_float(values, "NEURIO_POLL_JITTER_RATIO", 0.2),
             poll_min_gap_seconds=_optional_float(values, "NEURIO_POLL_MIN_GAP_SECONDS", 1.0),
             stale_after_seconds=_optional_float(values, "NEURIO_STALE_AFTER_SECONDS", 60.0),
+            hourly_stale_after_seconds=_optional_float(
+                values, "NEURIO_HOURLY_STALE_AFTER_SECONDS", 3900.0
+            ),
             sample_stale_skew_seconds=_optional_float(
                 values, "NEURIO_SAMPLE_STALE_SKEW_SECONDS", 180.0
             ),

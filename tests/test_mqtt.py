@@ -4,15 +4,17 @@ import json
 import threading
 import time
 import unittest
+from datetime import timedelta
 
 import support
-from neurio_collector.config import Config, ConfigError
+from neurio_collector.config import Config, ConfigError, Secret
+from neurio_collector.ha_ingest import ingest_ha_state
 from neurio_collector.ingest import ingest_body
 from neurio_collector.api import dispatch
 from neurio_collector.mqtt_client import MqttClient, MqttError, MqttMessage
 from neurio_collector.mqtt_ingest import mark_hourly_acked, store_hourly_record
 from neurio_collector.poller import Poller
-from neurio_collector.timeutil import parse_instant
+from neurio_collector.timeutil import format_utc, parse_instant
 
 RECEIVED = parse_instant("2026-11-06T18:00:05Z")
 HOURLY_ID = int(parse_instant("2026-11-06T17:00:00Z").timestamp())
@@ -111,6 +113,19 @@ class MqttConfigTests(unittest.TestCase):
         self.assertEqual(cfg.mqtt_raw_topic, "")
         cfg = mqtt_config(mqtt_raw_topic="")
         self.assertEqual(cfg.mqtt_raw_topic, "")
+
+    def test_hourly_stale_threshold_defaults_and_rejects_non_positive(self):
+        cfg = Config.from_env(BASE_ENV)
+        self.assertEqual(cfg.hourly_stale_after_seconds, 3900)
+        self.assertEqual(cfg.stale_after_seconds, 60)
+        overridden = Config.from_env(
+            {**BASE_ENV, "NEURIO_HOURLY_STALE_AFTER_SECONDS": "7200"}
+        )
+        self.assertEqual(overridden.hourly_stale_after_seconds, 7200)
+        self.assertEqual(overridden.stale_after_seconds, 60)
+        for raw in ("0", "-5", "nope"):
+            with self.assertRaises(ConfigError):
+                Config.from_env({**BASE_ENV, "NEURIO_HOURLY_STALE_AFTER_SECONDS": raw})
 
     def test_username_without_password_rejected(self):
         with self.assertRaises(ConfigError):
@@ -663,6 +678,261 @@ class HourlyApiTests(unittest.TestCase):
         self.assertEqual(body["hourly_records"]["stored"], 0)
         self.assertEqual(body["hourly_records"]["acked"], 0)
         self.assertIsNone(body["hourly_records"]["last_record_id"])
+
+
+FRESH_NOW = parse_instant("2026-11-06T18:00:00Z")
+
+
+class _HourlyClock:
+    """Poller stand-in that only exposes the hourly message time."""
+
+    def __init__(self, last_hourly_message_at):
+        self._at = last_hourly_message_at
+
+    def snapshot(self):
+        return {"last_hourly_message_at": self._at, "storage_writable": True}
+
+
+def _seconds_ago(seconds: float):
+    return FRESH_NOW - timedelta(seconds=seconds)
+
+
+def _stamp(seconds: float) -> str:
+    return format_utc(_seconds_ago(seconds))
+
+
+def _record_poll(db, seconds_ago: float, outcome: str = "success") -> None:
+    stamp = _stamp(seconds_ago)
+    db.record_poll(stamp, stamp, outcome, None, None, None, 0.0)
+
+
+def _store_hourly(db, cfg, seconds_ago: float, record_id: int = HOURLY_ID) -> None:
+    result = store_hourly_record(
+        db, hourly_body(id=record_id), _seconds_ago(seconds_ago), cfg
+    )
+    if result.outcome != "stored":
+        raise AssertionError(result.outcome)
+
+
+def _hourly_cfg(db, **overrides):
+    return mqtt_config(
+        data_dir=db.path.rsplit("/", 1)[0], mqtt_raw_topic="", **overrides
+    )
+
+
+def _device_cfg(db, **overrides):
+    return support.make_config(data_dir=db.path.rsplit("/", 1)[0], **overrides)
+
+
+def _ha_cfg(db, **overrides):
+    data = dict(
+        data_dir=db.path.rsplit("/", 1)[0],
+        source_mode="homeassistant",
+        neurio_url="",
+        ha_url="http://127.0.0.1",
+        ha_entity="sensor.neurio_raw",
+        ha_source_id="ha-relay:sensor.neurio_raw",
+        ha_token=Secret("synthetic-ha-token-not-a-secret"),
+    )
+    data.update(overrides)
+    return support.make_config(**data)
+
+
+def _ingest_ha(db, cfg, seconds_ago: float) -> None:
+    stamp = _stamp(seconds_ago)
+    body = json.dumps(
+        {
+            "entity_id": "sensor.neurio_raw",
+            "state": "OK",
+            "attributes": {"channels": [support.channel("NET", 3, 10, 0)]},
+            "last_changed": stamp,
+            "last_updated": stamp,
+            "last_reported": stamp,
+        }
+    ).encode()
+    result = ingest_ha_state(db, body, _seconds_ago(seconds_ago), cfg)
+    if result.outcome == "parse_error":
+        raise AssertionError(result.error)
+
+
+def _views(cfg, db, poller=None):
+    status_code, status, _ = dispatch("/api/v1/status", cfg, db, poller, now=FRESH_NOW)
+    latest_code, latest, _ = dispatch("/api/v1/latest", cfg, db, poller, now=FRESH_NOW)
+    if status_code != 200 or latest_code != 200:
+        raise AssertionError((status_code, latest_code))
+    return status, latest
+
+
+def _assert_fresh(test, status, latest, fresh, age, threshold):
+    for body in (status, latest):
+        test.assertEqual(body["device_fresh"], fresh)
+        if age is None:
+            test.assertIsNone(body["device_age_seconds"])
+        else:
+            test.assertAlmostEqual(body["device_age_seconds"], age, places=3)
+    test.assertEqual(status["staleness_threshold_seconds"], threshold)
+
+
+class ComposeMqttFileTests(unittest.TestCase):
+    def test_mqtt_compose_is_hourly_only_and_keeps_the_password_out_of_the_file(self):
+        root = support.ROOT
+        text = (root / "compose.mqtt.yml").read_text(encoding="utf-8")
+        self.assertIn('SOURCE_MODE: "mqtt"', text)
+        self.assertIn('MQTT_BROKER_HOST: "${MQTT_BROKER_HOST:-192.168.86.7}"', text)
+        self.assertIn('MQTT_BROKER_PORT: "${MQTT_BROKER_PORT:-1883}"', text)
+        self.assertIn('MQTT_USERNAME: "${MQTT_USERNAME:?set MQTT_USERNAME}"', text)
+        self.assertIn('MQTT_PASSWORD_FILE: "/run/secrets/mqtt_password"', text)
+        self.assertIn('MQTT_RAW_TOPIC: ""', text)
+        self.assertIn('MQTT_HOURLY_TOPIC: "neurio/hourly/energy"', text)
+        self.assertIn('MQTT_ACK_TOPIC: "neurio/hourly/ack"', text)
+        self.assertIn("mqtt_password:", text)
+        self.assertNotIn("ha_token", text)
+        self.assertNotIn("HA_TOKEN", text)
+        self.assertNotIn("HA_URL", text)
+        self.assertNotIn("NEURIO_URL", text)
+        for line in text.splitlines():
+            self.assertFalse(line.strip().startswith("MQTT_PASSWORD:"))
+        ha = (root / "compose.yml").read_text(encoding="utf-8")
+        self.assertIn('SOURCE_MODE: "homeassistant"', ha)
+        self.assertIn("ha_token", ha)
+        self.assertNotIn("MQTT_", ha)
+
+
+class HourlyFreshnessTests(unittest.TestCase):
+    def test_hourly_only_stays_fresh_past_the_raw_threshold(self):
+        db = support.open_db(self)
+        cfg = _hourly_cfg(db)
+        # A successful poll 120s ago is stale on the 60s raw clock.
+        _record_poll(db, 120)
+        _store_hourly(db, cfg, 120)
+        status, latest = _views(cfg, db)
+        _assert_fresh(self, status, latest, True, 120, 3900)
+
+    def test_hourly_only_threshold_is_inclusive_and_then_stale(self):
+        db = support.open_db(self)
+        cfg = _hourly_cfg(db)
+        _store_hourly(db, cfg, 3900)
+        status, latest = _views(cfg, db)
+        _assert_fresh(self, status, latest, True, 3900, 3900)
+
+        db = support.open_db(self)
+        cfg = _hourly_cfg(db)
+        _record_poll(db, 3901)
+        _store_hourly(db, cfg, 3901)
+        status, latest = _views(cfg, db)
+        _assert_fresh(self, status, latest, False, 3901, 3900)
+        code, ready, _ = dispatch("/readyz", cfg, db, None, now=FRESH_NOW)
+        self.assertEqual(code, 200)
+        self.assertTrue(ready["ready"])
+        self.assertFalse(ready["device_fresh"])
+
+    def test_hourly_only_without_an_hourly_message_is_not_fresh(self):
+        db = support.open_db(self)
+        cfg = _hourly_cfg(db)
+        _record_poll(db, 10)
+        status, latest = _views(cfg, db)
+        _assert_fresh(self, status, latest, False, None, 3900)
+
+    def test_hourly_only_uses_poller_time_ahead_of_an_older_row(self):
+        db = support.open_db(self)
+        cfg = _hourly_cfg(db)
+        _store_hourly(db, cfg, 4000)
+        poller = _HourlyClock(_stamp(30))
+        status, latest = _views(cfg, db, poller)
+        _assert_fresh(self, status, latest, True, 30, 3900)
+
+    def test_hourly_only_falls_back_to_the_stored_row_after_restart(self):
+        db = support.open_db(self)
+        cfg = _hourly_cfg(db)
+        _store_hourly(db, cfg, 200)
+        poller = _HourlyClock(None)
+        status, latest = _views(cfg, db, poller)
+        _assert_fresh(self, status, latest, True, 200, 3900)
+
+    def test_hourly_only_custom_threshold(self):
+        db = support.open_db(self)
+        cfg = _hourly_cfg(db, hourly_stale_after_seconds=1000)
+        _store_hourly(db, cfg, 1000)
+        status, latest = _views(cfg, db)
+        _assert_fresh(self, status, latest, True, 1000, 1000)
+
+        db = support.open_db(self)
+        cfg = _hourly_cfg(db, hourly_stale_after_seconds=1000)
+        _store_hourly(db, cfg, 1001)
+        status, latest = _views(cfg, db)
+        _assert_fresh(self, status, latest, False, 1001, 1000)
+
+    def test_whitespace_raw_topic_is_hourly_only(self):
+        db = support.open_db(self)
+        cfg = mqtt_config(
+            data_dir=db.path.rsplit("/", 1)[0], mqtt_raw_topic="   "
+        )
+        _record_poll(db, 120)
+        _store_hourly(db, cfg, 120)
+        status, latest = _views(cfg, db)
+        _assert_fresh(self, status, latest, True, 120, 3900)
+
+    def test_failed_poll_does_not_hide_a_recent_hourly_message(self):
+        db = support.open_db(self)
+        cfg = _hourly_cfg(db)
+        _record_poll(db, 5, outcome="mqtt_error")
+        _store_hourly(db, cfg, 100)
+        status, latest = _views(cfg, db)
+        _assert_fresh(self, status, latest, True, 100, 3900)
+
+    def test_raw_mqtt_keeps_the_short_poll_clock(self):
+        db = support.open_db(self)
+        cfg = mqtt_config(
+            data_dir=db.path.rsplit("/", 1)[0], hourly_stale_after_seconds=1
+        )
+        _record_poll(db, 30)
+        _store_hourly(db, cfg, 4000)
+        status, latest = _views(cfg, db, _HourlyClock(_stamp(5)))
+        _assert_fresh(self, status, latest, True, 30, 60)
+
+        db = support.open_db(self)
+        cfg = mqtt_config(data_dir=db.path.rsplit("/", 1)[0])
+        _record_poll(db, 90)
+        _store_hourly(db, cfg, 10)
+        status, latest = _views(cfg, db, _HourlyClock(_stamp(10)))
+        _assert_fresh(self, status, latest, False, 90, 60)
+
+        db = support.open_db(self)
+        cfg = mqtt_config(data_dir=db.path.rsplit("/", 1)[0])
+        _record_poll(db, 5, outcome="mqtt_error")
+        _store_hourly(db, cfg, 5)
+        status, latest = _views(cfg, db, _HourlyClock(_stamp(5)))
+        _assert_fresh(self, status, latest, False, None, 60)
+
+    def test_device_mode_ignores_hourly_records(self):
+        db = support.open_db(self)
+        cfg = _device_cfg(db, hourly_stale_after_seconds=1)
+        _record_poll(db, 30)
+        _store_hourly(db, cfg, 4000)
+        status, latest = _views(cfg, db, _HourlyClock(_stamp(5)))
+        _assert_fresh(self, status, latest, True, 30, 60)
+
+        db = support.open_db(self)
+        cfg = _device_cfg(db)
+        _record_poll(db, 90)
+        _store_hourly(db, cfg, 10)
+        status, latest = _views(cfg, db, _HourlyClock(_stamp(10)))
+        _assert_fresh(self, status, latest, False, 90, 60)
+
+    def test_home_assistant_mode_ignores_the_hourly_clock(self):
+        db = support.open_db(self)
+        cfg = _ha_cfg(db, hourly_stale_after_seconds=1)
+        _ingest_ha(db, cfg, 30)
+        _store_hourly(db, cfg, 4000)
+        status, latest = _views(cfg, db, _HourlyClock(_stamp(5)))
+        _assert_fresh(self, status, latest, True, 30, 60)
+
+        db = support.open_db(self)
+        cfg = _ha_cfg(db)
+        _ingest_ha(db, cfg, 90)
+        _store_hourly(db, cfg, 10)
+        status, latest = _views(cfg, db, _HourlyClock(_stamp(10)))
+        _assert_fresh(self, status, latest, False, 90, 60)
 
 
 if __name__ == "__main__":

@@ -83,7 +83,7 @@ def dispatch(path: str, cfg: Config, db, poller, now: datetime | None = None):
         if route == "/api/v1/status":
             return 200, build_status(cfg, db, poller, now), "json"
         if route == "/api/v1/latest":
-            return 200, latest_payload(cfg, db, now), "json"
+            return 200, latest_payload(cfg, db, now, poller), "json"
         if route == "/api/v1/channels":
             return 200, {"channels": list_channels(cfg, db)}, "json"
         if route == "/api/v1/samples":
@@ -159,9 +159,14 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
             reader.close()
     except sqlite3.Error:
         db_ok = False
-    fresh, age = _freshness(last_poll, cfg, now)
-    if cfg.source_mode == "homeassistant" and db_ok:
-        fresh, age = _ha_feed_fresh(db, cfg, now)
+    fresh, age = _feed_freshness(
+        cfg,
+        db if db_ok else None,
+        poller,
+        last_poll,
+        now,
+        hourly["last_received_at_utc"] if db_ok else None,
+    )
     snap = poller.snapshot() if poller is not None else {
         "running": False,
         "in_flight": False,
@@ -182,7 +187,7 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
         "storage_error": snap.get("storage_error"),
         "device_fresh": fresh,
         "device_age_seconds": age,
-        "staleness_threshold_seconds": cfg.stale_after_seconds,
+        "staleness_threshold_seconds": _active_stale_after_seconds(cfg),
         "schema_version": schema,
         "counts": counts,
         "poll": snap,
@@ -252,7 +257,7 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
     }
 
 
-def latest_payload(cfg: Config, db, now: datetime) -> dict:
+def latest_payload(cfg: Config, db, now: datetime, poller=None) -> dict:
     reader = db.reader()
     try:
         stored = _sample_by_sql(reader, cfg, "ORDER BY samples.id DESC LIMIT 1")
@@ -266,9 +271,7 @@ def latest_payload(cfg: Config, db, now: datetime) -> dict:
         ).fetchone()
     finally:
         reader.close()
-    fresh, age = _freshness(last_poll, cfg, now)
-    if cfg.source_mode == "homeassistant":
-        fresh, age = _ha_feed_fresh(db, cfg, now)
+    fresh, age = _feed_freshness(cfg, db, poller, last_poll, now)
     return {
         "device_fresh": fresh,
         "device_age_seconds": age,
@@ -606,6 +609,71 @@ def _ready(cfg: Config, db, poller, now: datetime):
         "process_ok": True,
         "device_fresh": body["device_fresh"],
     }, "json"
+
+
+_HOURLY_RECEIVED_UNSET = object()
+
+
+def _hourly_only_mqtt(cfg: Config) -> bool:
+    """MQTT mode with the raw current-sample subscription turned off."""
+    return cfg.source_mode == "mqtt" and not (cfg.mqtt_raw_topic or "").strip()
+
+
+def _active_stale_after_seconds(cfg: Config) -> float:
+    if _hourly_only_mqtt(cfg):
+        return cfg.hourly_stale_after_seconds
+    return cfg.stale_after_seconds
+
+
+def _feed_freshness(cfg, db, poller, last_poll, now, hourly_received_at=_HOURLY_RECEIVED_UNSET):
+    """device_fresh for the active source.
+
+    Device mode, Home Assistant mode, and MQTT mode with a raw topic keep the
+    short raw-sample clock. Hourly-only MQTT (MQTT_RAW_TOPIC empty) follows
+    the last hourly message instead: the running poller's
+    last_hourly_message_at, or the newest stored received_at_utc when this
+    process has not seen an hourly message yet.
+    """
+    if cfg.source_mode == "homeassistant" and db is not None:
+        return _ha_feed_fresh(db, cfg, now)
+    if _hourly_only_mqtt(cfg):
+        return _hourly_only_fresh(cfg, db, poller, now, hourly_received_at)
+    return _freshness(last_poll, cfg, now)
+
+
+def _hourly_only_fresh(cfg, db, poller, now, hourly_received_at):
+    anchor = _poller_hourly_message_at(poller)
+    if anchor is None:
+        if hourly_received_at is _HOURLY_RECEIVED_UNSET:
+            anchor = None if db is None else _latest_hourly_received_at(db)
+        else:
+            anchor = hourly_received_at
+    if not anchor:
+        return False, None
+    age = (now - parse_instant(anchor)).total_seconds()
+    return age <= cfg.hourly_stale_after_seconds, age
+
+
+def _poller_hourly_message_at(poller):
+    if poller is None:
+        return None
+    value = poller.snapshot().get("last_hourly_message_at")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _latest_hourly_received_at(db):
+    reader = db.reader()
+    try:
+        row = reader.execute(
+            "SELECT MAX(received_at_utc) AS last_received FROM hourly_records"
+        ).fetchone()
+    finally:
+        reader.close()
+    if row is None:
+        return None
+    return row["last_received"]
 
 
 def _ha_feed_fresh(db, cfg: Config, now: datetime):
