@@ -4,7 +4,7 @@ A Python service that records a Neurio/PWRview energy monitor. It reads `current
 
 - **Device.** HTTP GET of the monitor's LAN `current-sample` URL.
 - **Home Assistant.** HTTP GET of one entity, by default `sensor.neurio_raw`. Home Assistant may fill that entity from a LAN poll or from MQTT. This service only reads the entity state, and it does not change Home Assistant.
-- **MQTT.** Subscribes to an ESPHome Neurio bridge (see `loucks1/esphome-neurio-openevse`) on a local MQTT broker. Raw samples arrive on `neurio/raw` and are stored exactly like device samples, with `source_kind` set to `mqtt_bridge`. Hourly energy records arrive on `neurio/hourly/energy` (QoS 1) and are stored in `hourly_records`. The recorder publishes the record id to `neurio/hourly/ack` only after the record is durably stored; a record that fails to parse or store is never acknowledged, so the bridge keeps it queued and republishes it. The MQTT client is paho-mqtt (see Dependencies below); packet framing, keepalive, and QoS 1 acknowledgement are paho's, not hand-rolled.
+- **MQTT.** Subscribes to an ESPHome Neurio bridge (see `loucks1/esphome-neurio-openevse`) on a local MQTT broker. Raw samples arrive on `neurio/raw` and are stored exactly like device samples, with `source_kind` set to `mqtt_bridge`. Hourly energy records arrive on `neurio/hourly/energy` (QoS 1) and are stored in `hourly_records`. The recorder publishes the record id to `neurio/hourly/ack` only after the record is durably stored; a record that fails to parse or store is never acknowledged, so the bridge keeps it queued and republishes it. Bridge firmware note: current `esphome-neurio-openevse` (main since 2026-11-10) no longer publishes `neurio/raw` — live values reach Home Assistant over the ESPHome API instead — so against current firmware this mode records the hourly records only. The raw subscription remains for older firmware or any other publisher of current-sample bodies, and can be turned off by setting `MQTT_RAW_TOPIC` empty. The MQTT client is paho-mqtt (see Dependencies below); packet framing, keepalive, and QoS 1 acknowledgement are paho's, not hand-rolled.
 
 Dependencies: everything in this project is the Python standard library except the MQTT client, which is paho-mqtt, pinned exactly in `requirements.txt`. MQTT is a solved protocol with sharp edges (framing, keepalive, QoS handshakes), so it is a library rather than hand-written code. The Docker image pip-installs that one package at build time; paho is imported lazily, so the device and Home Assistant modes never touch it.
 
@@ -59,7 +59,7 @@ There is no default bind address and no default device URL. `check-config` exits
 | `MQTT_PASSWORD_FILE` | broker login | Preferred. File contents are the broker password. Do not also set `MQTT_PASSWORD` |
 | `MQTT_PASSWORD` | broker login | Inline alternative to the file |
 | `MQTT_CLIENT_ID` | no | Default `neurio-recorder` |
-| `MQTT_RAW_TOPIC` | no | Default `neurio/raw`. Exact topic; wildcards are rejected |
+| `MQTT_RAW_TOPIC` | no | Default `neurio/raw`. Exact topic; wildcards are rejected. Set empty (`MQTT_RAW_TOPIC=`) to disable the raw subscription — current bridge firmware publishes no raw feed, so MQTT mode then records hourly records only |
 | `MQTT_HOURLY_TOPIC` | no | Default `neurio/hourly/energy`. Exact topic; wildcards are rejected |
 | `MQTT_ACK_TOPIC` | no | Default `neurio/hourly/ack`. The record id is published here as bare decimal text |
 | `MQTT_KEEPALIVE_SECONDS` | no | Default 60 |
@@ -105,7 +105,7 @@ PYTHONPATH=src python3 -m neurio_collector check-config
 PYTHONPATH=src python3 -m neurio_collector
 ```
 
-On a broker that requires a login, also set `MQTT_USERNAME` and `MQTT_PASSWORD_FILE`. The recorder subscribes to the raw topic at QoS 0 and the hourly topic at QoS 1, and reconnects with backoff when the broker drops the connection.
+On a broker that requires a login, also set `MQTT_USERNAME` and `MQTT_PASSWORD_FILE`. The recorder subscribes to the raw topic at QoS 0 (unless disabled with an empty `MQTT_RAW_TOPIC`) and the hourly topic at QoS 1, and reconnects with backoff when the broker drops the connection. `/api/v1/status` reports the two feeds separately under `mqtt_relay` — message counts and last-message times for each — so a silent raw feed is visible rather than masked by hourly traffic.
 
 `/healthz` is process liveness. `/readyz` is database readiness and stays up when the source is stale. `GET /api/v1/status` reports `device_fresh` separately. Other routes: `/api/v1/latest`, `/api/v1/channels`, `/api/v1/samples`, `/api/v1/spans`, `/api/v1/energy`, `/api/v1/hourly` (the MQTT hourly records, with their acknowledgement times; `/api/v1/status` also counts and summarizes them), and `/api/v1/export/`. The API is GET-only.
 

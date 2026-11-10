@@ -218,7 +218,14 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
             "broker_port": cfg.mqtt_broker_port,
             "tls": cfg.mqtt_tls,
             "raw_topic": cfg.mqtt_raw_topic,
+            "raw_topic_enabled": bool(
+                cfg.mqtt_raw_topic and cfg.mqtt_raw_topic.strip()
+            ),
+            "raw_messages": snap.get("mqtt_raw_messages"),
+            "last_raw_message_at_utc": snap.get("last_raw_message_at"),
             "hourly_topic": cfg.mqtt_hourly_topic,
+            "hourly_messages": snap.get("mqtt_hourly_messages"),
+            "last_hourly_message_at_utc": snap.get("last_hourly_message_at"),
             "ack_topic": cfg.mqtt_ack_topic,
         },
         "source_built": True,
