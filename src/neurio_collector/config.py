@@ -239,7 +239,15 @@ class Config:
             mqtt_username = _optional_blank(values, "MQTT_USERNAME")
             mqtt_password = _read_secret(values, "MQTT_PASSWORD_FILE", "MQTT_PASSWORD")
             mqtt_client_id = _optional_str(values, "MQTT_CLIENT_ID", "neurio-recorder")
-            mqtt_raw_topic = _optional_str(values, "MQTT_RAW_TOPIC", "neurio/raw")
+            if "MQTT_RAW_TOPIC" in values:
+                # Presence is meaningful: an explicitly empty MQTT_RAW_TOPIC
+                # disables the raw sample subscription. Current bridge
+                # firmware publishes no raw feed (live values go to Home
+                # Assistant over the ESPHome API), so MQTT mode then records
+                # hourly records only.
+                mqtt_raw_topic = (values["MQTT_RAW_TOPIC"] or "").strip()
+            else:
+                mqtt_raw_topic = "neurio/raw"
             mqtt_hourly_topic = _optional_str(
                 values, "MQTT_HOURLY_TOPIC", "neurio/hourly/energy"
             )
@@ -396,7 +404,6 @@ def validate_mqtt_settings(cfg: "Config") -> None:
     if not cfg.mqtt_client_id or not cfg.mqtt_client_id.strip():
         raise ConfigError("MQTT_CLIENT_ID must not be empty")
     for name, topic in (
-        ("MQTT_RAW_TOPIC", cfg.mqtt_raw_topic),
         ("MQTT_HOURLY_TOPIC", cfg.mqtt_hourly_topic),
         ("MQTT_ACK_TOPIC", cfg.mqtt_ack_topic),
     ):
@@ -406,6 +413,12 @@ def validate_mqtt_settings(cfg: "Config") -> None:
             raise ConfigError(
                 f"{name} must be an exact topic. Wildcards (+, #) are not accepted."
             )
+    # The raw topic is the one exception to "must not be empty": empty means
+    # the raw sample subscription is disabled (hourly-only MQTT mode).
+    if cfg.mqtt_raw_topic and ("+" in cfg.mqtt_raw_topic or "#" in cfg.mqtt_raw_topic):
+        raise ConfigError(
+            "MQTT_RAW_TOPIC must be an exact topic. Wildcards (+, #) are not accepted."
+        )
     has_username = bool(cfg.mqtt_username and cfg.mqtt_username.strip())
     has_password = cfg.mqtt_password is not None and bool(cfg.mqtt_password.reveal())
     if has_username and not has_password:

@@ -89,6 +89,10 @@ class Poller:
             "last_error": None,
             "storage_writable": True,
             "storage_error": None,
+            "mqtt_raw_messages": 0,
+            "mqtt_hourly_messages": 0,
+            "last_raw_message_at": None,
+            "last_hourly_message_at": None,
         }
 
     def start(self) -> None:
@@ -141,12 +145,12 @@ class Poller:
                             last_attempt_started_at=format_utc(self.clock()),
                         )
                         client.connect()
-                        client.subscribe(
-                            [
-                                (self.cfg.mqtt_raw_topic, 0),
-                                (self.cfg.mqtt_hourly_topic, 1),
-                            ]
-                        )
+                        subscriptions = []
+                        raw_topic = (self.cfg.mqtt_raw_topic or "").strip()
+                        if raw_topic:
+                            subscriptions.append((raw_topic, 0))
+                        subscriptions.append((self.cfg.mqtt_hourly_topic, 1))
+                        client.subscribe(subscriptions)
                         self._update(in_flight=False)
                     message = client.poll(0.5)
                     if message is None:
@@ -173,13 +177,24 @@ class Poller:
                 except Exception:
                     pass
 
+    def _note_mqtt_feed(self, kind: str, at) -> None:
+        with self._state_lock:
+            if kind == "raw":
+                self.state["mqtt_raw_messages"] += 1
+                self.state["last_raw_message_at"] = format_utc(at)
+            else:
+                self.state["mqtt_hourly_messages"] += 1
+                self.state["last_hourly_message_at"] = format_utc(at)
+
     def _handle_mqtt_message(self, client, message: MqttMessage) -> None:
         started = self.clock()
         self._update(in_flight=True, last_attempt_started_at=format_utc(started))
         try:
             if message.topic == self.cfg.mqtt_raw_topic:
+                self._note_mqtt_feed("raw", started)
                 self._handle_mqtt_raw(started, message)
             elif message.topic == self.cfg.mqtt_hourly_topic:
+                self._note_mqtt_feed("hourly", started)
                 self._handle_mqtt_hourly(client, started, message)
             # Subscriptions are exact topics, so a message on any other
             # topic is not ours. Ignore it.

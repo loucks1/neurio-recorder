@@ -104,6 +104,14 @@ class MqttConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             mqtt_config(mqtt_ack_topic="neurio/hourly/+")
 
+    def test_raw_topic_explicitly_empty_disables_it(self):
+        cfg = Config.from_env({**BASE_ENV, "MQTT_RAW_TOPIC": ""})
+        self.assertEqual(cfg.mqtt_raw_topic, "")
+        cfg = Config.from_env({**BASE_ENV, "MQTT_RAW_TOPIC": "   "})
+        self.assertEqual(cfg.mqtt_raw_topic, "")
+        cfg = mqtt_config(mqtt_raw_topic="")
+        self.assertEqual(cfg.mqtt_raw_topic, "")
+
     def test_username_without_password_rejected(self):
         with self.assertRaises(ConfigError):
             Config.from_env({**BASE_ENV, "MQTT_USERNAME": "bridge"})
@@ -504,6 +512,42 @@ class MqttPollerTests(unittest.TestCase):
         sample = db.conn.execute("SELECT source_kind FROM samples").fetchone()
         self.assertEqual(sample["source_kind"], "mqtt_bridge")
         self.assertTrue(fake.closed)
+        snap = poller.snapshot()
+        self.assertEqual(snap["mqtt_raw_messages"], 1)
+        self.assertEqual(snap["mqtt_hourly_messages"], 1)
+        self.assertIsNotNone(snap["last_raw_message_at"])
+        self.assertIsNotNone(snap["last_hourly_message_at"])
+
+    def test_poller_hourly_only_when_raw_disabled(self):
+        db = support.open_db(self)
+        cfg = mqtt_config(mqtt_raw_topic="")
+        fake = FakeMqttClient(
+            [MqttMessage(topic="neurio/hourly/energy", payload=hourly_body(), qos=1)]
+        )
+        poller = Poller(cfg, db, mqtt_client_factory=lambda: fake)
+        poller.start()
+        try:
+            row = wait_for(
+                self,
+                db,
+                "SELECT acked_at_utc FROM hourly_records "
+                "WHERE record_id=? AND acked_at_utc IS NOT NULL",
+                (HOURLY_ID,),
+            )
+            self.assertIsNotNone(row["acked_at_utc"])
+        finally:
+            poller.stop()
+        self.assertEqual(fake.subscriptions, [("neurio/hourly/energy", 1)])
+        self.assertEqual(
+            fake.published, [("neurio/hourly/ack", str(HOURLY_ID).encode())]
+        )
+        snap = poller.snapshot()
+        self.assertEqual(snap["mqtt_hourly_messages"], 1)
+        self.assertEqual(snap["mqtt_raw_messages"], 0)
+        self.assertIsNotNone(snap["last_hourly_message_at"])
+        self.assertIsNone(snap["last_raw_message_at"])
+        count = db.conn.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
+        self.assertEqual(count, 0)
 
     def test_poller_never_acks_a_bad_hourly_payload(self):
         db = support.open_db(self)
@@ -589,6 +633,24 @@ class HourlyApiTests(unittest.TestCase):
             [r["record_id"] for r in page2["hourly_records"]], [second_id]
         )
         self.assertIsNone(page2["next_cursor"])
+
+    def test_status_mqtt_relay_reports_raw_disabled(self):
+        db = support.open_db(self)
+        cfg = mqtt_config(data_dir=db.path.rsplit("/", 1)[0], mqtt_raw_topic="")
+        status, body, _ = dispatch("/api/v1/status", cfg, db, None)
+        self.assertEqual(status, 200)
+        relay = body["mqtt_relay"]
+        self.assertEqual(relay["raw_topic"], "")
+        self.assertFalse(relay["raw_topic_enabled"])
+
+    def test_status_mqtt_relay_reports_raw_enabled_by_default(self):
+        db = support.open_db(self)
+        cfg = self._cfg_for(db)
+        status, body, _ = dispatch("/api/v1/status", cfg, db, None)
+        self.assertEqual(status, 200)
+        relay = body["mqtt_relay"]
+        self.assertEqual(relay["raw_topic"], "neurio/raw")
+        self.assertTrue(relay["raw_topic_enabled"])
 
     def test_hourly_empty_database(self):
         db = support.open_db(self)
