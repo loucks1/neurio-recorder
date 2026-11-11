@@ -9,9 +9,8 @@ next message or None / ``close``, with connection failures raised as
 MqttError so the poller's backoff owns reconnect policy
 (``reconnect_on_failure=False``; paho never reconnects on its own here).
 
-paho is imported lazily, at client construction, so the device and
-Home Assistant modes — and any tooling that imports this module — work in
-environments where the package is not installed.
+paho is imported lazily, at client construction, so tooling that imports
+this module still works where the package is not installed.
 
 Inbound payloads larger than ``max_message_bytes`` are dropped before they
 reach the ingest path and counted on ``dropped_oversize``.

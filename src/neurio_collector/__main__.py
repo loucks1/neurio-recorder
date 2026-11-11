@@ -1,7 +1,8 @@
 """Command line.
 
-The default command serves the read-only API and the poller. Backup, restore,
-retention, and config checks do not bind a port and do not poll the device.
+The default command serves the read-only API and the MQTT hourly subscriber.
+Backup, restore, and config checks do not bind a port and do not connect to
+the broker.
 """
 
 from __future__ import annotations
@@ -15,8 +16,6 @@ from .config import Config, ConfigError
 from .db import Database
 from .locking import InstanceLock, LockError
 from .poller import Poller
-from .retention import apply_retention
-from .timeutil import utcnow
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,10 +34,6 @@ def main(argv: list[str] | None = None) -> int:
     restore.add_argument("--lock", required=True)
     verify = sub.add_parser("verify-backup")
     verify.add_argument("--src", required=True)
-    retain = sub.add_parser("retention")
-    retain.add_argument("--db", required=True)
-    retain.add_argument("--raw-days", type=int, default=14)
-    retain.add_argument("--poll-days", type=int, default=30)
     sub.add_parser("check-config")
     parsed = parser.parse_args(argv)
     try:
@@ -54,16 +49,6 @@ def main(argv: list[str] | None = None) -> int:
         if parsed.command == "restore":
             restore_backup(parsed.src, parsed.db, parsed.lock)
             print(parsed.db)
-            return 0
-        if parsed.command == "retention":
-            db = Database(parsed.db)
-            try:
-                raw_count, spans = apply_retention(
-                    db, utcnow(), parsed.raw_days, parsed.poll_days
-                )
-            finally:
-                db.close()
-            print(f"raw_payloads_cleared={raw_count} spans_remaining={spans}")
             return 0
         if parsed.command == "check-config":
             Config.from_env().validate()

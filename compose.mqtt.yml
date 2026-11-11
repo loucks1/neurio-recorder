@@ -1,6 +1,5 @@
-# Hourly-only MQTT deployment for current esphome-neurio-openevse firmware,
-# which no longer publishes neurio/raw. This file stands alone. Do not combine
-# it with compose.yml (that file remains the Home Assistant deployment).
+# Hourly MQTT deployment. This is the only Compose file. The recorder
+# subscribes to neurio/hourly/energy and acknowledges on neurio/hourly/ack.
 #
 # Host environment (Compose interpolates .env, then the shell):
 #   PUBLISH_ADDRESS          host IP that publishes 8095 (default 192.168.86.20)
@@ -48,9 +47,6 @@ services:
       MQTT_BROKER_PORT: "${MQTT_BROKER_PORT:-1883}"
       MQTT_USERNAME: "${MQTT_USERNAME:?set MQTT_USERNAME}"
       MQTT_PASSWORD_FILE: "/run/secrets/mqtt_password"
-      # Empty on purpose. Unset would fall back to neurio/raw. Current
-      # firmware publishes no raw feed, so this deployment is hourly-only.
-      MQTT_RAW_TOPIC: ""
       MQTT_HOURLY_TOPIC: "neurio/hourly/energy"
       MQTT_ACK_TOPIC: "neurio/hourly/ack"
       NEURIO_HOURLY_STALE_AFTER_SECONDS: "${NEURIO_HOURLY_STALE_AFTER_SECONDS:-3900}"
@@ -61,11 +57,6 @@ services:
       NEURIO_POLL_INTERVAL_SECONDS: "15"
       NEURIO_POLL_TIMEOUT_SECONDS: "3"
       NEURIO_POLL_MAX_BACKOFF_SECONDS: "300"
-      NEURIO_TIMEZONE: "America/Chicago"
-      NEURIO_TOPOLOGY_VERIFIED: "false"
-      NEURIO_CONSUMPTION_SOURCE: "consumption_channel"
-      NEURIO_REDACT_IDENTITY: "true"
-      NEURIO_RAW_RETENTION_DAYS: "0"
     healthcheck:
       test:
         [

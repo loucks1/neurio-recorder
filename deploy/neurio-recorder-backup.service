@@ -9,5 +9,5 @@ Description=Online backup of the Neurio recorder SQLite database
 Type=oneshot
 WorkingDirectory=/srv/neurio-recorder
 Environment=NEURIO_BACKUP_ROOT=/srv/neurio-recorder
-Environment=NEURIO_COMPOSE_FILE=/srv/neurio-recorder/compose.yml
+Environment=NEURIO_COMPOSE_FILE=/srv/neurio-recorder/compose.mqtt.yml
 ExecStart=/usr/bin/python3 /srv/neurio-recorder/online-backup.py
