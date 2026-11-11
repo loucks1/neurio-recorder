@@ -12,7 +12,7 @@ Environment:
       Default: /srv/neurio-recorder
   NEURIO_COMPOSE_FILE
       Compose file passed to ``docker compose -f``.
-      Default: $NEURIO_BACKUP_ROOT/compose.yml
+      Default: $NEURIO_BACKUP_ROOT/compose.mqtt.yml
   NEURIO_COMPOSE_SERVICE
       Service name. Default: neurio-recorder
   NEURIO_CONTAINER_DB
@@ -48,7 +48,7 @@ def _int_env(name: str, default: int) -> int:
 def main() -> None:
     root = pathlib.Path(os.environ.get("NEURIO_BACKUP_ROOT", "/srv/neurio-recorder"))
     compose_file = pathlib.Path(
-        os.environ.get("NEURIO_COMPOSE_FILE", str(root / "compose.yml"))
+        os.environ.get("NEURIO_COMPOSE_FILE", str(root / "compose.mqtt.yml"))
     )
     service = os.environ.get("NEURIO_COMPOSE_SERVICE", "neurio-recorder")
     container_db = os.environ.get("NEURIO_CONTAINER_DB", "/data/neurio.sqlite")

@@ -19,7 +19,7 @@ tar -C "$root" -czf "$archive" \
   .dockerignore \
   .gitignore \
   .env.example \
-  compose.yml \
+  compose.mqtt.yml \
   LICENSE \
   README.md \
   pyproject.toml \

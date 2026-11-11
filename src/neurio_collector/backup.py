@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sqlite3
 
+from .db import ACCEPTED_SCHEMA_VERSIONS
 from .locking import InstanceLock, LockError
 
 
@@ -58,7 +59,7 @@ def verify_backup(path: str) -> None:
         version = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()
-        if version is None or version[0] not in {"1", "2"}:
+        if version is None or version[0] not in ACCEPTED_SCHEMA_VERSIONS:
             raise BackupError("unexpected schema_version")
     finally:
         conn.close()

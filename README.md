@@ -1,100 +1,75 @@
 # Neurio recorder
 
-A Python service that records a Neurio/PWRview energy monitor. It reads `current-sample` data in one of three modes:
+A Python service that stores hourly energy records from an ESPHome Neurio bridge (see `loucks1/esphome-neurio-openevse`). It subscribes to `neurio/hourly/energy` at QoS 1 and publishes the record id to `neurio/hourly/ack` only after the row is durable. A record that fails to parse or store is never acknowledged, so the bridge keeps it queued. The MQTT session is persistent (`clean_session` false). The client is paho-mqtt, pinned in `requirements.txt`.
 
-- **Device.** HTTP GET of the monitor's LAN `current-sample` URL.
-- **Home Assistant.** HTTP GET of one entity, by default `sensor.neurio_raw`. Home Assistant may fill that entity from a LAN poll or from MQTT. This service only reads the entity state, and it does not change Home Assistant.
-- **MQTT.** Subscribes to an ESPHome Neurio bridge (see `loucks1/esphome-neurio-openevse`) on a local MQTT broker. Raw samples arrive on `neurio/raw` and are stored exactly like device samples, with `source_kind` set to `mqtt_bridge`. Hourly energy records arrive on `neurio/hourly/energy` (QoS 1) and are stored in `hourly_records`. The recorder publishes the record id to `neurio/hourly/ack` only after the record is durably stored; a record that fails to parse or store is never acknowledged, so the bridge keeps it queued and republishes it. Bridge firmware note: current `esphome-neurio-openevse` (main since 2026-11-10) no longer publishes `neurio/raw` — live values reach Home Assistant over the ESPHome API instead — so against current firmware this mode records the hourly records only. The raw subscription remains for older firmware or any other publisher of current-sample bodies, and can be turned off by setting `MQTT_RAW_TOPIC` empty. The MQTT client is paho-mqtt (see Dependencies below); packet framing, keepalive, and QoS 1 acknowledgement are paho's, not hand-rolled.
+The process does not poll the monitor, does not read Home Assistant, and does not subscribe to a raw sample topic.
 
-Dependencies: everything in this project is the Python standard library except the MQTT client, which is paho-mqtt, pinned exactly in `requirements.txt`. MQTT is a solved protocol with sharp edges (framing, keepalive, QoS handshakes), so it is a library rather than hand-written code. The Docker image pip-installs that one package at build time; paho is imported lazily, so the device and Home Assistant modes never touch it.
+Readings go into SQLite. The read-only API serves hourly history. Online backup uses the SQLite backup API so a copy is consistent while the recorder is running.
 
-Readings go into SQLite. Raw JSON is kept indefinitely when `NEURIO_RAW_RETENTION_DAYS=0` (the Compose example). The read-only API serves history and CSV. Online backup uses the SQLite backup API so a copy is consistent while the collector is running.
-
-The image runs as uid 10001 with a read-only root filesystem, all capabilities dropped, and no new privileges. The Home Assistant token is a file mounted read-only, not a value in the image or the repository.
+The image runs as uid 10001 with a read-only root filesystem, all capabilities dropped, and no new privileges. The broker password is a file mounted read-only, not a value in the image or the repository.
 
 Fixture tests are not live verification of a device.
 
 ## Data model
 
-SQLite is in WAL mode with `synchronous=FULL`. One process holds `DATA_DIR/collector.lock`. Instants are stored in UTC. Integer watt-seconds are the energy unit. See `docs/ENERGY_RULES.md` for channels, spans, gaps, and time zones, and `docs/EXPORTS.md` for the API and CSV columns.
+SQLite is in WAL mode with `synchronous=FULL`. One process holds `DATA_DIR/collector.lock`. Instants are stored in UTC. Hourly energy values are integer milli-kWh.
 
 | Table | What it stores |
 |---|---|
-| `sensors` | Device `sensorId`, or `ha-relay:{entity}` in relay mode, plus a `sensor_token` (first 16 hex characters of SHA-256) used when identity is redacted |
-| `channels` | Channel type, number, and stable `identity_key` |
-| `samples` | Receive time, device timestamp, clock quality, payload hash, `raw_json`, and Home Assistant provenance columns |
-| `sample_channels` | `p_W`, `q_VAR`, `v_V`, `eImp_Ws`, `eExp_Ws` |
-| `sample_cts` | Per-CT power. Not added into household totals |
-| `counter_epochs`, `energy_spans` | Counter baselines and non-negative deltas |
-| `poll_attempts` | Poll outcomes. Aged out separately from samples |
-| `hourly_records` | MQTT mode only. One row per bridge hourly energy record: the record id, its energy values in integer milli-kWh, the raw JSON, and the time the record was acknowledged |
+| `meta` | `schema_version` (currently `3`) and any other keys already present |
+| `sensors` | The sensor id and `sensor_token` already recorded. Kept so `GET /api/v1/channels` can return `sensor_id`. The token is not served. New hourly records do not add rows |
+| `hourly_records` | One row per bridge hourly energy record: the record id, energy values in integer milli-kWh, the raw JSON, and the time the record was acknowledged |
+| `hourly_backfill_provenance` | Left untouched when it already exists. This process does not create or modify it |
 
-A repeated payload hash is a duplicate and does not create another span. A counter decrease opens a new epoch and does not store a negative delta.
+Opening the database migrates it to schema 3. The migration drops `sample_channels`, `sample_cts`, `energy_spans`, `counter_epochs`, `samples`, `channels`, and `poll_attempts`, then runs `VACUUM` when it actually dropped tables or the schema version was not yet 3. It does not change rows in `hourly_records`, `hourly_backfill_provenance`, or `sensors`. Running it again is a no-op aside from rewriting `schema_version` to `3`.
+
+`poll_attempts` was an attempt log. MQTT mode appended a row for each hourly message and connection error, and `/api/v1/status` used to read the latest row. Freshness and storage do not depend on it: the running process keeps the same fields in memory, and after a restart freshness comes from `hourly_records.received_at_utc`. The table is dropped and nothing writes it.
+
+## API
+
+`/healthz` is process liveness. `/readyz` is database readiness and stays up when the hourly feed is stale. The API is GET-only.
+
+`GET /api/v1/hourly?limit=168&cursor=<record_id>` pages `hourly_records` by `record_id`. `limit` defaults to 100 and must be from 1 to 1000. `cursor` defaults to 0 and is exclusive (`record_id` greater than the cursor). The response is `{"hourly_records": [...], "next_cursor": "<id>" | null}`. Each record has `record_id`, `device_timestamp_raw`, `device_timestamp_utc`, `retries`, `received_at_utc`, `acked_at_utc`, and the kWh strings `net_import_kwh`, `net_export_kwh`, `net_delta_net_kwh`, `generation_delta_export_kwh`, `consumption_delta_import_kwh`, `phase_a_delta_import_kwh`, and `phase_b_delta_import_kwh`.
+
+`GET /api/v1/channels` still returns `{"channels": [...]}`. Each preserved `sensors` row is one object with `identity_key`, `type`, `ch`, `first_seen_utc`, `last_seen_utc`, `reading_notice`, `label`, and `sensor_id` (omitted only for the historical missing-id placeholder). `sensor_id` is the stored id. `sensor_token` is not included. `type`, `ch`, `identity_key`, and `label` are null because those columns lived on `channels`, which is dropped. rate-plan-tool reads this route when it does not already know the sensor id.
+
+`GET /api/v1/status` reports `device_fresh` from the last hourly message. A running process uses the subscriber's last hourly message time. After a restart, before this process has seen a message, it uses the newest `hourly_records.received_at_utc`. The threshold is `NEURIO_HOURLY_STALE_AFTER_SECONDS` (default 3900). Status counts hourly records only.
+
+`/api/v1/energy`, `/api/v1/samples`, `/api/v1/spans`, `/api/v1/latest`, and the CSV exports are gone.
 
 ## Configuration
 
-There is no default bind address and no default device URL. `check-config` exits 0 when the selected mode is complete and exits 2 when it is not.
+There is no default bind address. `check-config` exits 0 when the configuration is complete and exits 2 when it is not.
 
-`0.0.0.0` and `::` are refused unless `ALLOW_CONTAINER_WILDCARD_BIND=host-publish-pinned`. In Compose, pair that opt-in with a host publish address pinned to one IP. Do not publish `8095:8095`, which listens on every host address.
+`0.0.0.0` and `::` are refused unless `ALLOW_CONTAINER_WILDCARD_BIND=host-publish-pinned`. In Compose, pair that opt-in with a host publish address pinned to one IP.
 
-`NEURIO_POLL_INTERVAL_SECONDS` must be from 10 to 3600. The default is 15. A 5-second interval is rejected so this process cannot match a fast Home Assistant poll. In MQTT mode nothing is polled; the interval is only the base of the reconnect backoff and has no minimum.
+`SOURCE_MODE` must be `mqtt`. `NEURIO_URL`, Home Assistant variables, and a non-empty `MQTT_RAW_TOPIC` are rejected. An empty `MQTT_RAW_TOPIC` is ignored so an older compose file that set it to empty still starts.
+
+`NEURIO_POLL_INTERVAL_SECONDS` is the base of the reconnect backoff. It must be greater than 0 and at most 3600. Nothing is polled.
 
 | Variable | Required | Role |
 |---|---|---|
-| `SOURCE_MODE` | yes | `device`, `homeassistant`, or `mqtt` |
+| `SOURCE_MODE` | yes | `mqtt` |
 | `BIND_ADDRESS` | yes | IP address. No hostname |
 | `BIND_PORT` | yes | 1–65535 |
 | `DATA_DIR` | yes | Absolute path of the SQLite directory |
-| `NEURIO_URL` | device mode | `http://` LAN URL whose path is `/current-sample`. Cloud hosts and URLs with credentials are rejected |
-| `HA_URL` | relay mode | Origin only. No userinfo, path, query, or fragment |
-| `HA_ENTITY` | relay mode | Entity id, such as `sensor.neurio_raw` |
-| `HA_SOURCE_ID` | relay mode | Must start with `ha-relay:`. Default `ha-relay:{HA_ENTITY}` |
-| `HA_TOKEN_FILE` | relay mode | Preferred. File contents are the long-lived token. Do not also set `HA_TOKEN` |
-| `HA_TOKEN` | relay mode | Inline alternative to the file. Not for Compose |
-| `HA_ALLOW_RFC1918_HTTP` | HTTP to RFC1918 | Must be `accept-unencrypted-bearer` or the process refuses the URL |
-| `MQTT_BROKER_HOST` | mqtt mode | Broker hostname or IP address. No scheme, port, or path |
+| `MQTT_BROKER_HOST` | yes | Broker hostname or IP. No scheme, port, or path |
 | `MQTT_BROKER_PORT` | no | Default 1883 |
 | `MQTT_TLS` | no | Default `false`. TLS verifies against the system CA store |
-| `MQTT_USERNAME` | broker login | Must be set together with a password, or both left unset for an anonymous login |
+| `MQTT_USERNAME` | broker login | Must be set together with a password, or both left unset |
 | `MQTT_PASSWORD_FILE` | broker login | Preferred. File contents are the broker password. Do not also set `MQTT_PASSWORD` |
 | `MQTT_PASSWORD` | broker login | Inline alternative to the file |
 | `MQTT_CLIENT_ID` | no | Default `neurio-recorder` |
-| `MQTT_RAW_TOPIC` | no | Default `neurio/raw`. Exact topic; wildcards are rejected. Set empty (`MQTT_RAW_TOPIC=`) to disable the raw subscription — current bridge firmware publishes no raw feed, so MQTT mode then records hourly records only |
 | `MQTT_HOURLY_TOPIC` | no | Default `neurio/hourly/energy`. Exact topic; wildcards are rejected |
 | `MQTT_ACK_TOPIC` | no | Default `neurio/hourly/ack`. The record id is published here as bare decimal text |
 | `MQTT_KEEPALIVE_SECONDS` | no | Default 60 |
 | `ALLOW_CONTAINER_WILDCARD_BIND` | with `0.0.0.0` | Must be `host-publish-pinned` |
-| `NEURIO_RAW_RETENTION_DAYS` | no | `0` keeps `raw_json`. A positive number clears older payloads only. **Unset means 14** |
-| `NEURIO_POLL_LOG_RETENTION_DAYS` | no | Deletes aged poll-attempt rows. Default 30. Must be at least 1 |
-| `NEURIO_TIMEZONE` | no | Export zone. Default `America/Chicago`. Fixed offsets are rejected |
-| `NEURIO_CONSUMPTION_SOURCE` | no | `consumption_channel` (default), `none`, or `derive_net_plus_generation` |
-| `NEURIO_TOPOLOGY_VERIFIED` | no | Must be `true` before `derive_net_plus_generation` is accepted. Default `false` |
-| `NEURIO_GENERATION_REGISTER` | no | `unset` (default), `e_imp`, or `e_exp` |
-| `NEURIO_REDACT_IDENTITY` | no | Default `true`. Omits sensor ids from the API and CSV |
-| `NEURIO_POLL_TIMEOUT_SECONDS` | no | Default 3. Must be shorter than the interval in device and relay modes. In mqtt mode it is the MQTT socket timeout: greater than 0 and at most 120 |
+| `NEURIO_HOURLY_STALE_AFTER_SECONDS` | no | Default 3900. Does not fail `/readyz` |
+| `NEURIO_POLL_INTERVAL_SECONDS` | no | Default 15. Reconnect backoff base |
+| `NEURIO_POLL_TIMEOUT_SECONDS` | no | Default 3. MQTT socket timeout, greater than 0 and at most 120 |
 | `NEURIO_POLL_MAX_BACKOFF_SECONDS` | no | Default 300 |
 | `NEURIO_POLL_JITTER_RATIO` | no | Default 0.2 |
-| `NEURIO_STALE_AFTER_SECONDS` | no | Default 60. `device_fresh` in device mode, Home Assistant mode, and MQTT mode when `MQTT_RAW_TOPIC` is set. Staleness does not fail `/readyz` |
-| `NEURIO_HOURLY_STALE_AFTER_SECONDS` | no | Default 3900 (one hour plus five minutes). `device_fresh` only when `SOURCE_MODE=mqtt` and `MQTT_RAW_TOPIC` is empty. The age is the last hourly message |
-| `NEURIO_MAX_ALLOCATABLE_GAP_SECONDS` | no | Default 45 |
-
-Device-mode local run:
-
-```sh
-export SOURCE_MODE=device
-export BIND_ADDRESS=127.0.0.1
-export BIND_PORT=8095
-export DATA_DIR=/absolute/path/to/data
-export NEURIO_URL=http://192.168.1.50/current-sample
-export NEURIO_POLL_INTERVAL_SECONDS=15
-export NEURIO_RAW_RETENTION_DAYS=0
-PYTHONPATH=src python3 -m neurio_collector check-config
-PYTHONPATH=src python3 -m neurio_collector
-```
-
-Relay mode uses the same process. Leave `NEURIO_URL` unset. The process reads the token file once, sends it only as `Authorization: Bearer`, and strips it from stored payloads and error text.
-
-MQTT mode uses the same process. Leave `NEURIO_URL` and the Home Assistant variables unset:
+| `NEURIO_MAX_RESPONSE_BYTES` | no | Default 1000000. Oversize MQTT payloads are dropped |
 
 ```sh
 export SOURCE_MODE=mqtt
@@ -106,68 +81,44 @@ PYTHONPATH=src python3 -m neurio_collector check-config
 PYTHONPATH=src python3 -m neurio_collector
 ```
 
-On a broker that requires a login, also set `MQTT_USERNAME` and `MQTT_PASSWORD_FILE`. The recorder subscribes to the raw topic at QoS 0 (unless disabled with an empty `MQTT_RAW_TOPIC`) and the hourly topic at QoS 1, and reconnects with backoff when the broker drops the connection. `/api/v1/status` reports the two feeds separately under `mqtt_relay` — message counts and last-message times for each — so a silent raw feed is visible rather than masked by hourly traffic.
-
-When `MQTT_RAW_TOPIC` is empty, `device_fresh` on `/api/v1/status` and `/api/v1/latest` follows the last hourly message. A running process uses the poller's `last_hourly_message_at`. If this process has not seen an hourly message yet, including just after a restart, it uses the newest `hourly_records.received_at_utc`. The threshold is `NEURIO_HOURLY_STALE_AFTER_SECONDS` (default 3900). `staleness_threshold_seconds` in the status payload reports that value. Device mode, Home Assistant mode, and MQTT mode with a raw topic keep `NEURIO_STALE_AFTER_SECONDS` (default 60) and do not consult the hourly clock.
-
-`/healthz` is process liveness. `/readyz` is database readiness and stays up when the source is stale. `GET /api/v1/status` reports `device_fresh` separately. Other routes: `/api/v1/latest`, `/api/v1/channels`, `/api/v1/samples`, `/api/v1/spans`, `/api/v1/energy`, `/api/v1/hourly` (the MQTT hourly records, with their acknowledgement times; `/api/v1/status` also counts and summarizes them), and `/api/v1/export/`. The API is GET-only.
+On a broker that requires a login, also set `MQTT_USERNAME` and `MQTT_PASSWORD_FILE`.
 
 ## Deploy with Docker Compose
 
-The image installs one pinned package, paho-mqtt, at build time. Everything else at runtime is the Python 3.12 standard library.
+`compose.mqtt.yml` is the deployment. It sets `SOURCE_MODE=mqtt`, `MQTT_HOURLY_TOPIC=neurio/hourly/energy`, and `MQTT_ACK_TOPIC=neurio/hourly/ack`.
 
-`compose.yml` is the Home Assistant deployment. `compose.mqtt.yml` is a separate file for hourly-only MQTT mode. Use one of them. Do not pass both `-f` files together.
+Broker host and port come from the environment, defaulting to `192.168.86.7` and `1883`. `MQTT_USERNAME` is required. The broker password is the Compose file secret `mqtt_password`: the host file `MQTT_PASSWORD_HOST_FILE` (default `/srv/neurio-recorder/mqtt_password`) is mounted read-only at `/run/secrets/mqtt_password`.
 
-### Home Assistant
+The same `.env` keys as the current production file are interpolated: `PUBLISH_ADDRESS`, `DATA_HOST_PATH`, `BACKUP_HOST_PATH`, `MQTT_BROKER_HOST`, `MQTT_USERNAME`, and `MQTT_PASSWORD_HOST_FILE`.
 
-1. Create the data and backup directories and give uid 10001 write access (`chown 10001:10001`, mode such as `0750`).
-2. Create the token file, mode `0600`, containing only the long-lived Home Assistant token. Compose mounts it read-only at `/run/secrets/ha_token`.
-3. Copy `.env.example` to `.env` and set `PUBLISH_ADDRESS`, `HA_URL`, and the host paths. The example values are placeholders on `192.168.1.0/24`.
-4. Build and start:
+Startup migrates the live database. Back it up first. The migration drops the raw tables listed above and runs `VACUUM`. Hourly rows, provenance rows, and the sensor row stay.
 
-```sh
-docker compose up -d --build
-docker compose exec -T neurio-recorder python3 -m neurio_collector check-config
-```
-
-`compose.yml` keeps the process read-only, drops all capabilities, sets `no-new-privileges`, limits memory and CPU, and publishes one host address. A green healthcheck means the process answered `/healthz`. It does not mean the monitor answered. Use `/api/v1/status` and `device_fresh` for that. Do not restart the container because the device is stale.
-
-Plain HTTP to a literal RFC1918 Home Assistant address is rejected unless `HA_ALLOW_RFC1918_HTTP=accept-unencrypted-bearer`. The flag does not allow DNS names, public addresses, link-local, or metadata addresses, and it does not turn off HTTPS certificate checks. Redirects are not followed. Environment proxies are not used.
-
-For device mode, drop the secret, set `SOURCE_MODE=device` and `NEURIO_URL`, and do not set the Home Assistant variables.
-
-### MQTT
-
-`compose.mqtt.yml` runs the same image against the ESPHome bridge's hourly topics. It sets `SOURCE_MODE=mqtt`, leaves `MQTT_RAW_TOPIC` empty, sets `MQTT_HOURLY_TOPIC=neurio/hourly/energy` and `MQTT_ACK_TOPIC=neurio/hourly/ack`, and does not set `NEURIO_URL` or any `HA_*` variable. It does not mount the `ha_token` secret.
-
-Broker host and port come from the environment, defaulting to `192.168.86.7` and `1883`. `MQTT_USERNAME` is required. The broker password is the Compose file secret `mqtt_password`: the host file `MQTT_PASSWORD_HOST_FILE` (default `/srv/neurio-recorder/mqtt_password`) is mounted read-only at `/run/secrets/mqtt_password`, and the process reads it through `MQTT_PASSWORD_FILE`. The password is not stored in this repository, in `compose.mqtt.yml`, or in `.env`.
-
-Both Compose files use the project name `neurio-lan-collector`. Starting the MQTT file recreates that service. If this host already has a collector database, back it up before that. No schema migration is required: `hourly_records` already exists.
-
-1. Back up the existing database. From the running Home Assistant container, or any process that can see the files:
+1. Back up the existing database from the running container:
 
 ```sh
-docker compose exec -T neurio-recorder python3 -m neurio_collector backup --db /data/neurio.sqlite --dest /backups/neurio-YYYYmmddTHHMMSSZ.sqlite
-docker compose exec -T neurio-recorder python3 -m neurio_collector verify-backup --src /backups/neurio-YYYYmmddTHHMMSSZ.sqlite
+docker compose -f compose.mqtt.yml exec -T neurio-recorder python3 -m neurio_collector backup --db /data/neurio.sqlite --dest /backups/neurio-YYYYmmddTHHMMSSZ.sqlite
+docker compose -f compose.mqtt.yml exec -T neurio-recorder python3 -m neurio_collector verify-backup --src /backups/neurio-YYYYmmddTHHMMSSZ.sqlite
 ```
+
+Take that backup with the current image if you still need the raw tables. `verify-backup` on this version accepts schema versions 1, 2, and 3, and it does not migrate the file it checks. Starting this version is what migrates the live database.
 
 2. Create the data and backup directories if they are not already there, and give uid 10001 write access (`chown 10001:10001`, mode such as `0750`).
-3. Create the password file, mode `0600`, containing only the broker password. The default path is `/srv/neurio-recorder/mqtt_password`.
-4. In `.env`, set `PUBLISH_ADDRESS` to the host address that should publish port 8095, and set `MQTT_USERNAME`. Set `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT`, `MQTT_PASSWORD_HOST_FILE`, or `NEURIO_HOURLY_STALE_AFTER_SECONDS` only to override the defaults (`192.168.86.7`, `1883`, `/srv/neurio-recorder/mqtt_password`, `3900`).
-5. Build and start with the MQTT file alone:
+3. Create the password file, mode `0600`, containing only the broker password.
+4. In `.env`, set `PUBLISH_ADDRESS`, `MQTT_USERNAME`, and any overrides.
+5. Build and start:
 
 ```sh
 docker compose -f compose.mqtt.yml up -d --build
 docker compose -f compose.mqtt.yml exec -T neurio-recorder python3 -m neurio_collector check-config
 ```
 
-The container has the same read-only root, dropped capabilities, `no-new-privileges`, and memory and CPU limits as the Home Assistant file. `/healthz` still means the process is up. `device_fresh` in this mode is the hourly-message check described above.
+`/healthz` means the process is up. `device_fresh` is the hourly-message check. A full disk is reported on `/readyz` and does not delete hourly rows.
+
+If a backup timer still points `NEURIO_COMPOSE_FILE` at `compose.yml`, point it at `compose.mqtt.yml`. The example unit and the default in `deploy/online-backup.py` already do.
 
 ## Backup and restore
 
-Copying `neurio.sqlite` while `neurio.sqlite-wal` is non-empty is not a consistent backup. A filesystem copy or a hypervisor snapshot is not a substitute. Use the SQLite backup API. The backup command does not delete older copies.
-
-Inside the running container, or anywhere the `neurio_collector` module and the files are visible:
+Copying `neurio.sqlite` while `neurio.sqlite-wal` is non-empty is not a consistent backup. Use the SQLite backup API. The backup command does not delete older copies and does not migrate the source.
 
 ```sh
 python3 -m neurio_collector backup --db /data/neurio.sqlite --dest /backups/neurio-YYYYmmddTHHMMSSZ.sqlite
@@ -176,45 +127,24 @@ python3 -m neurio_collector verify-backup --src /backups/neurio-YYYYmmddTHHMMSSZ
 
 `deploy/backup.sh` runs those two commands. Set `DB_PATH` and `BACKUP_DIR`.
 
-Restore only after the collector is stopped:
+Restore only after the recorder is stopped:
 
 ```sh
 python3 -m neurio_collector restore \
   --src /backups/neurio-YYYYmmddTHHMMSSZ.sqlite \
   --db /data/neurio.sqlite \
   --lock /data/collector.lock
-python3 -m neurio_collector verify-backup --src /data/neurio.sqlite
 ```
 
-`deploy/restore.sh` does the same. It does not start or stop the container. Restore refuses a held lock, refuses a non-empty WAL, and writes one `neurio.sqlite.pre-restore` safety copy. A second restore refuses while that copy is still present. Move it aside before restoring again.
+`deploy/restore.sh` does the same. Restore refuses a held lock, refuses a non-empty WAL, and writes one `neurio.sqlite.pre-restore` safety copy. A second restore refuses while that copy is still present. Restoring a schema 2 backup and then starting this version migrates that restored file and drops its raw tables. The backup file itself is unchanged.
 
-`deploy/online-backup.py` is an optional host script for a daily timer. It locks, refuses to run when the backup directory already holds 30 copies or 5 GiB (or the configured caps), refuses when free space is under 2 GiB or twice the database size, then `docker compose exec`s `backup` and `verify-backup`. It never deletes an old copy. Paths come from the environment; see the script docstring. Example units are `deploy/neurio-recorder-backup.service` and `deploy/neurio-recorder-backup.timer`. Copy the script onto the host, edit the paths, then enable the timer.
-
-Retention, which the running poller also applies about every six hours:
-
-```sh
-python3 -m neurio_collector retention --db /data/neurio.sqlite --raw-days 0 --poll-days 30
-```
-
-More detail is in `docs/OPERATIONS.md`.
-
-## Limitations
-
-- In Home Assistant mode the normalized device timestamp and device `sensorId` stay null. Ordering uses `last_updated`. If the entity document contains a device timestamp or sensor id, those values are kept only in `samples.raw_json`. Clearing raw JSON drops them. Channel counters are still parsed from `attributes.channels`. Short gaps can be allocated on `ha_last_updated`; they are not device-clock spans.
-- `NEURIO_RAW_RETENTION_DAYS` defaults to 14 when omitted. The Compose example sets `0` so raw JSON is kept. Zero does not delete rows.
-- Poll-attempt rows still age out. A full disk is reported on `/readyz` and does not trigger deletion.
-- `/api/v1/status` includes static fields (`docker_image_built`, `deployed`, `lan_device_verified`) that the process does not update from the environment. Use `device_fresh`, `db_ok`, and the database to judge a running system. The observation timestamps in that payload are a recorded November 2026 channel snapshot, not a measurement this process took.
-- `rateplantool_contract` stays false. This service does not implement `oauth2/token`, `users/current`, or `samples`, and it does not invent hour-boundary cumulatives. The general CSV is not a cumulative watt-second import. See `docs/RATEPLANTOOL_CONTRACT.md`.
-- Household topology is unverified until you set `NEURIO_TOPOLOGY_VERIFIED=true`. The default consumption source is the dedicated `CONSUMPTION` channel.
-- This service does not modify Home Assistant's own poll or MQTT configuration.
+`deploy/online-backup.py` is an optional host script for a daily timer. It never deletes an old copy. Example units are `deploy/neurio-recorder-backup.service` and `deploy/neurio-recorder-backup.timer`.
 
 ## Tests
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
-
-Synthetic payloads use sensor id `SYNTHETIC-NOT-A-DEVICE`. The observed channel fixture is labeled in its `_provenance` object.
 
 ## License
 

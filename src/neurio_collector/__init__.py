@@ -1,8 +1,8 @@
-"""LAN collector for a physical Neurio/PWRview sensor.
+"""Hourly MQTT recorder for a Neurio/PWRview monitor.
 
-This package polls the device's local current-sample endpoint, stores raw and
-normalized readings, and serves read-only history. It does not call Neurio
-cloud APIs and it does not change Home Assistant's existing poll.
+The process subscribes to hourly energy records, stores them in SQLite, and
+serves a read-only API. It does not poll the monitor and it does not read
+Home Assistant.
 """
 
 __version__ = "1.0.0"

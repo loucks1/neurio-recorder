@@ -1,7 +1,7 @@
 [project]
 name = "neurio-lan-collector"
 version = "1.0.0"
-description = "Read-only collector for a Neurio/PWRview current-sample endpoint"
+description = "Hourly MQTT recorder for a Neurio/PWRview monitor"
 requires-python = ">=3.12"
 readme = "README.md"
 license = "MIT"
