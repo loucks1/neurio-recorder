@@ -621,7 +621,6 @@ class HourlyApiTests(unittest.TestCase):
         self.assertEqual(
             list(item),
             [
-                "sensor_token",
                 "identity_key",
                 "type",
                 "ch",
@@ -633,12 +632,37 @@ class HourlyApiTests(unittest.TestCase):
             ],
         )
         self.assertEqual(item["sensor_id"], "ha-relay:sensor.neurio_raw")
-        self.assertEqual(item["sensor_token"], "abc123token")
+        self.assertNotIn("sensor_token", item)
         self.assertIsNone(item["type"])
         self.assertIsNone(item["ch"])
         self.assertIsNone(item["identity_key"])
         self.assertEqual(item["reading_notice"], "device_collector")
         self.assertEqual(item["first_seen_utc"], "2026-11-01T00:00:00.000Z")
+
+    def test_channels_response_contains_no_token(self):
+        db = support.open_db(self)
+        token = "secret-sensor-token-value"
+        db.conn.execute(
+            "INSERT INTO sensors(sensor_id, sensor_token, first_seen_utc, last_seen_utc) "
+            "VALUES(?, ?, ?, ?)",
+            (
+                "ha-relay:sensor.neurio_raw",
+                token,
+                "2026-11-01T00:00:00.000Z",
+                "2026-11-10T00:00:00.000Z",
+            ),
+        )
+        status, body, _ = dispatch("/api/v1/channels", support.make_config(), db, None)
+        self.assertEqual(status, 200)
+        encoded = json.dumps(body)
+        self.assertNotIn(token, encoded)
+        self.assertNotIn("sensor_token", encoded)
+        self.assertEqual(body["channels"][0]["sensor_id"], "ha-relay:sensor.neurio_raw")
+        for item in body["channels"]:
+            for key, value in item.items():
+                self.assertNotIn("token", key.lower())
+                if isinstance(value, str):
+                    self.assertNotIn(token, value)
 
     def test_hourly_empty_database(self):
         db = support.open_db(self)

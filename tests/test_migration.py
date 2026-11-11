@@ -1,5 +1,6 @@
 """Schema 3 drops raw-mode tables and leaves hourly data alone."""
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -239,7 +240,8 @@ class MigrationTests(unittest.TestCase):
             status, body, _ = dispatch("/api/v1/channels", cfg, db, None)
             self.assertEqual(status, 200)
             self.assertEqual(body["channels"][0]["sensor_id"], "ha-relay:sensor.neurio_raw")
-            self.assertEqual(body["channels"][0]["sensor_token"], "abc123token")
+            self.assertNotIn("sensor_token", body["channels"][0])
+            self.assertNotIn("abc123token", json.dumps(body))
         finally:
             db.close()
 

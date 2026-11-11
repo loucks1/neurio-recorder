@@ -17,7 +17,7 @@ SQLite is in WAL mode with `synchronous=FULL`. One process holds `DATA_DIR/colle
 | Table | What it stores |
 |---|---|
 | `meta` | `schema_version` (currently `3`) and any other keys already present |
-| `sensors` | The sensor id and `sensor_token` already recorded. Kept so `GET /api/v1/channels` can still return them. New hourly records do not add rows |
+| `sensors` | The sensor id and `sensor_token` already recorded. Kept so `GET /api/v1/channels` can return `sensor_id`. The token is not served. New hourly records do not add rows |
 | `hourly_records` | One row per bridge hourly energy record: the record id, energy values in integer milli-kWh, the raw JSON, and the time the record was acknowledged |
 | `hourly_backfill_provenance` | Left untouched when it already exists. This process does not create or modify it |
 
@@ -31,7 +31,7 @@ Opening the database migrates it to schema 3. The migration drops `sample_channe
 
 `GET /api/v1/hourly?limit=168&cursor=<record_id>` pages `hourly_records` by `record_id`. `limit` defaults to 100 and must be from 1 to 1000. `cursor` defaults to 0 and is exclusive (`record_id` greater than the cursor). The response is `{"hourly_records": [...], "next_cursor": "<id>" | null}`. Each record has `record_id`, `device_timestamp_raw`, `device_timestamp_utc`, `retries`, `received_at_utc`, `acked_at_utc`, and the kWh strings `net_import_kwh`, `net_export_kwh`, `net_delta_net_kwh`, `generation_delta_export_kwh`, `consumption_delta_import_kwh`, `phase_a_delta_import_kwh`, and `phase_b_delta_import_kwh`.
 
-`GET /api/v1/channels` still returns `{"channels": [...]}`. Each preserved `sensors` row is one object with `sensor_token`, `identity_key`, `type`, `ch`, `first_seen_utc`, `last_seen_utc`, `reading_notice`, `label`, and `sensor_id` (omitted only for the historical missing-id placeholder). `sensor_id` and `sensor_token` are the stored values. `type`, `ch`, `identity_key`, and `label` are null because those columns lived on `channels`, which is dropped. `sensor_id` is included even though older builds omitted it when `NEURIO_REDACT_IDENTITY=true`. rate-plan-tool reads this route when it does not already know the sensor id.
+`GET /api/v1/channels` still returns `{"channels": [...]}`. Each preserved `sensors` row is one object with `identity_key`, `type`, `ch`, `first_seen_utc`, `last_seen_utc`, `reading_notice`, `label`, and `sensor_id` (omitted only for the historical missing-id placeholder). `sensor_id` is the stored id. `sensor_token` is not included. `type`, `ch`, `identity_key`, and `label` are null because those columns lived on `channels`, which is dropped. rate-plan-tool reads this route when it does not already know the sensor id.
 
 `GET /api/v1/status` reports `device_fresh` from the last hourly message. A running process uses the subscriber's last hourly message time. After a restart, before this process has seen a message, it uses the newest `hourly_records.received_at_utc`. The threshold is `NEURIO_HOURLY_STALE_AFTER_SECONDS` (default 3900). Status counts hourly records only.
 

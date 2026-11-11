@@ -181,22 +181,20 @@ def list_channels(db) -> dict:
 
     rate-plan-tool calls ``GET /api/v1/channels`` only to learn the sensor id.
     The channels table is gone, so each preserved ``sensors`` row is returned
-    as one object in the historical ``channels`` array. ``sensor_id`` and
-    ``sensor_token`` are the stored values. Channel type, number, identity,
-    and label were columns on ``channels`` and are null.
+    as one object. ``sensor_id`` is the stored id. ``sensor_token`` is not
+    selected and is not returned. Channel type, number, identity, and label
+    were columns on ``channels`` and are null.
     """
     reader = db.reader()
     try:
         rows = reader.execute(
-            "SELECT sensor_id, sensor_token, first_seen_utc, last_seen_utc "
-            "FROM sensors ORDER BY sensor_token, id"
+            "SELECT sensor_id, first_seen_utc, last_seen_utc FROM sensors ORDER BY id"
         ).fetchall()
     finally:
         reader.close()
     channels = []
     for row in rows:
         item = {
-            "sensor_token": row["sensor_token"],
             "identity_key": None,
             "type": None,
             "ch": None,
