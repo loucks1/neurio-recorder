@@ -2,8 +2,10 @@
 
 BIND_ADDRESS has no default. Unspecified addresses (0.0.0.0, ::) are refused
 unless the operator sets ALLOW_CONTAINER_WILDCARD_BIND=host-publish-pinned.
-The only source is MQTT hourly records. Device polling and the Home Assistant
-relay are gone, and a non-empty MQTT_RAW_TOPIC is rejected.
+The only local source is MQTT hourly records. Device polling and the Home
+Assistant relay are gone, and a non-empty MQTT_RAW_TOPIC is rejected. Cloud
+ingest (NEURIO_CLIENT_ID / NEURIO_CLIENT_SECRET) is a separate, optional,
+outbound-only source configured at the bottom of this module's validation.
 """
 
 from __future__ import annotations
@@ -12,6 +14,9 @@ import ipaddress
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
+
+from .timeutil import parse_instant
 
 
 WILDCARD_OPT_IN = "host-publish-pinned"
@@ -63,6 +68,15 @@ class Config:
     mqtt_hourly_topic: str = "neurio/hourly/energy"
     mqtt_ack_topic: str = "neurio/hourly/ack"
     mqtt_keepalive_seconds: int = 60
+    cloud_client_id: str | None = None
+    cloud_client_secret: Secret | None = None
+    cloud_grant_type: str = "client_credentials"
+    cloud_sensor_id: str | None = None
+    cloud_api_base: str = "https://api.neur.io/v1"
+    cloud_sync_interval_seconds: float = 3600.0
+    cloud_tail_hours: int = 48
+    cloud_harvest_from: str | None = None
+    cloud_timeout_seconds: float = 30.0
     poll_interval_seconds: float = 15.0
     poll_timeout_seconds: float = 3.0
     poll_max_backoff_seconds: float = 300.0
@@ -81,6 +95,20 @@ class Config:
     def lock_path(self) -> str:
         return os.path.join(self.data_dir, "collector.lock")
 
+    @property
+    def cloud_configured(self) -> bool:
+        """Cloud ingest is on only when both OAuth credentials are present.
+
+        It is independent of the MQTT source: the cloud is a second,
+        outbound-only source alongside the hourly MQTT records.
+        """
+        return bool(
+            self.cloud_client_id
+            and self.cloud_client_id.strip()
+            and self.cloud_client_secret is not None
+            and self.cloud_client_secret.reveal()
+        )
+
     def validate(self) -> None:
         _validate_bind(
             self.bind_address,
@@ -96,6 +124,7 @@ class Config:
                 "relay have been removed."
             )
         validate_mqtt_settings(self)
+        validate_cloud_settings(self)
         if not 0 < self.poll_interval_seconds <= 3600:
             raise ConfigError(
                 "NEURIO_POLL_INTERVAL_SECONDS must be > 0 and <= 3600. "
@@ -152,6 +181,25 @@ class Config:
             ),
             mqtt_ack_topic=_optional_str(values, "MQTT_ACK_TOPIC", "neurio/hourly/ack"),
             mqtt_keepalive_seconds=_optional_int(values, "MQTT_KEEPALIVE_SECONDS", 60),
+            cloud_client_id=_optional_blank(values, "NEURIO_CLIENT_ID"),
+            cloud_client_secret=_read_secret(
+                values, "NEURIO_CLIENT_SECRET_FILE", "NEURIO_CLIENT_SECRET"
+            ),
+            cloud_grant_type=_optional_str(
+                values, "NEURIO_GRANT_TYPE", "client_credentials"
+            ),
+            cloud_sensor_id=_optional_blank(values, "NEURIO_CLOUD_SENSOR_ID"),
+            cloud_api_base=_optional_str(
+                values, "NEURIO_CLOUD_API_BASE", "https://api.neur.io/v1"
+            ).rstrip("/"),
+            cloud_sync_interval_seconds=_optional_float(
+                values, "NEURIO_CLOUD_SYNC_INTERVAL_SECONDS", 3600.0
+            ),
+            cloud_tail_hours=_optional_int(values, "NEURIO_CLOUD_TAIL_HOURS", 48),
+            cloud_harvest_from=_optional_blank(values, "NEURIO_CLOUD_HARVEST_FROM"),
+            cloud_timeout_seconds=_optional_float(
+                values, "NEURIO_CLOUD_TIMEOUT_SECONDS", 30.0
+            ),
             poll_interval_seconds=_optional_float(values, "NEURIO_POLL_INTERVAL_SECONDS", 15.0),
             poll_timeout_seconds=_optional_float(values, "NEURIO_POLL_TIMEOUT_SECONDS", 3.0),
             poll_max_backoff_seconds=_optional_float(
@@ -190,6 +238,56 @@ def _read_secret(env: dict[str, str], file_key: str, inline_key: str) -> Secret 
     if inline:
         return Secret(inline)
     return None
+
+
+def validate_cloud_settings(cfg: "Config") -> None:
+    """Cloud ingest settings. The cloud API base configured here is the one
+    sanctioned cloud destination; it has nothing to do with the removed
+    device-polling and Home Assistant URLs."""
+    has_id = bool(cfg.cloud_client_id and cfg.cloud_client_id.strip())
+    has_secret = (
+        cfg.cloud_client_secret is not None and bool(cfg.cloud_client_secret.reveal())
+    )
+    if has_id != has_secret:
+        raise ConfigError(
+            "NEURIO_CLIENT_ID and NEURIO_CLIENT_SECRET (or "
+            "NEURIO_CLIENT_SECRET_FILE) must be set together. Cloud ingest "
+            "is disabled when neither is set."
+        )
+    if not has_id:
+        return
+    if not cfg.cloud_grant_type or not cfg.cloud_grant_type.strip():
+        raise ConfigError("NEURIO_GRANT_TYPE must not be empty")
+    parsed = urlparse(cfg.cloud_api_base)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ConfigError(
+            "NEURIO_CLOUD_API_BASE must not include userinfo, a query, or a fragment"
+        )
+    host = parsed.hostname
+    if not host:
+        raise ConfigError("NEURIO_CLOUD_API_BASE is missing a host")
+    if parsed.scheme == "http" and host not in {"127.0.0.1", "::1", "localhost"}:
+        raise ConfigError(
+            "NEURIO_CLOUD_API_BASE must be https. Plain http is accepted only "
+            "for a loopback host, so a local test server can stand in for the "
+            "cloud; the OAuth client secret must never cross the network "
+            "unencrypted."
+        )
+    if parsed.scheme not in {"https", "http"}:
+        raise ConfigError("NEURIO_CLOUD_API_BASE must be https (or loopback http)")
+    if cfg.cloud_sync_interval_seconds < 60:
+        raise ConfigError("NEURIO_CLOUD_SYNC_INTERVAL_SECONDS must be at least 60")
+    if not 1 <= cfg.cloud_tail_hours <= 2160:
+        raise ConfigError("NEURIO_CLOUD_TAIL_HOURS must be between 1 and 2160")
+    if not 0 < cfg.cloud_timeout_seconds <= 300:
+        raise ConfigError("NEURIO_CLOUD_TIMEOUT_SECONDS must be > 0 and <= 300")
+    if cfg.cloud_harvest_from:
+        try:
+            parse_instant(cfg.cloud_harvest_from)
+        except ValueError as exc:
+            raise ConfigError(
+                "NEURIO_CLOUD_HARVEST_FROM must be an ISO timestamp with an offset"
+            ) from exc
 
 
 def validate_mqtt_settings(cfg: "Config") -> None:
