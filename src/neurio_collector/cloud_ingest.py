@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS cloud_sync_state (
   last_attempt_at_utc TEXT,
   last_success_at_utc TEXT,
   last_error TEXT,
-  last_error_at_utc TEXT
+  last_error_at_utc TEXT,
+  backoff_until_utc TEXT
 );
 """
 
@@ -62,6 +63,17 @@ CREATE TABLE IF NOT EXISTS cloud_sync_state (
 def ensure_cloud_tables(db: Database) -> None:
     with db.write_lock:
         db.conn.executescript(CLOUD_SCHEMA)
+        # CREATE TABLE IF NOT EXISTS does not add columns to a table that
+        # already exists. A database synced before pacing shipped has the
+        # original cloud_sync_state and needs the backoff column.
+        have = {
+            row[1]
+            for row in db.conn.execute("PRAGMA table_info(cloud_sync_state)")
+        }
+        if "backoff_until_utc" not in have:
+            db.conn.execute(
+                "ALTER TABLE cloud_sync_state ADD COLUMN backoff_until_utc TEXT"
+            )
 
 
 _STATE_COLUMNS = {
@@ -73,6 +85,7 @@ _STATE_COLUMNS = {
     "last_success_at_utc",
     "last_error",
     "last_error_at_utc",
+    "backoff_until_utc",
 }
 
 

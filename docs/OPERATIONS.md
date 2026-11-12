@@ -4,7 +4,7 @@ This process subscribes to one MQTT hourly topic and acknowledges a record only 
 
 ## Health
 
-`/healthz` answers when the process is up. `/readyz` answers when the database can be read and the schema version is `3`. A stale hourly feed does not fail readiness, and it does not by itself restart the container. `/api/v1/status` reports `device_fresh` from the last hourly message against `NEURIO_HOURLY_STALE_AFTER_SECONDS` (default 3900).
+`/healthz` answers when the process is up. `/readyz` answers when the database can be read and the schema version is `3`. A stale hourly feed does not fail readiness, and it does not by itself restart the container. A failure isolated to the merged-view summary (the `merge` section of `/api/v1/status`) does not fail readiness and does not clear `db_ok`. `/api/v1/status` reports `device_fresh` from the last hourly message against `NEURIO_HOURLY_STALE_AFTER_SECONDS` (default 3900).
 
 `docker_image_built` and `deployed` in the status payload stay false. The process does not learn those from the environment.
 

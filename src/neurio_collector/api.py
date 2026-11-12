@@ -8,18 +8,20 @@ database. Liveness is the process.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .config import Config
+from .config import CLOUD_PUBLISHED_LIMIT_PER_HOUR, Config
 from .db import SCHEMA_VERSION
 from .hourly_merge import (
+    CLOUD_STATS_SOURCE,
     existing_tables,
     is_divergent,
     pct_difference,
-    provenance_cloud_ids,
+    provenance_by_record,
 )
 from .timeutil import parse_instant, utcnow
 from .units import ws_to_kwh_str
@@ -118,13 +120,13 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
         "hours_stored": None,
         "oldest_hour_end_utc": None,
         "newest_hour_end_utc": None,
+        "published_limit_per_hour": CLOUD_PUBLISHED_LIMIT_PER_HOUR,
+        "max_requests_per_hour": cfg.cloud_max_requests_per_hour,
+        "min_request_interval_seconds": cfg.cloud_request_interval_seconds,
+        "backing_off": False,
+        "backoff_until_utc": None,
     }
-    merge = {
-        "counts": {"neurio": None, "esp32": None},
-        "divergence_count": None,
-        "divergent_hours": None,
-        "worst_divergent": [],
-    }
+    merge = _empty_merge()
     try:
         reader = db.reader()
         try:
@@ -169,86 +171,50 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
             else:
                 cloud["hours_stored"] = 0
             if "cloud_sync_state" in cloud_tables:
-                state_row = reader.execute(
-                    "SELECT sensor_id, harvest_from_utc, harvest_through_utc, "
-                    "harvest_complete, last_attempt_at_utc, last_success_at_utc, "
-                    "last_error, last_error_at_utc FROM cloud_sync_state WHERE id=1"
-                ).fetchone()
-                if state_row is not None:
-                    if cloud["sensor_id"] is None:
-                        cloud["sensor_id"] = state_row["sensor_id"]
-                    cloud["harvest_from_utc"] = state_row["harvest_from_utc"]
-                    cloud["harvest_through_utc"] = state_row["harvest_through_utc"]
-                    cloud["harvest_complete"] = bool(state_row["harvest_complete"])
-                    cloud["last_attempt_at_utc"] = state_row["last_attempt_at_utc"]
-                    cloud["last_success_at_utc"] = state_row["last_success_at_utc"]
-                    cloud["last_error"] = state_row["last_error"]
-                    cloud["last_error_at_utc"] = state_row["last_error_at_utc"]
-            # Merge summary for the merged hourly view: stored hours by
-            # origin over the union of both tables, plus divergence
-            # between native ESP32 rows and cloud rows for the same hour.
-            esp_ids = {
-                row[0] for row in reader.execute("SELECT record_id FROM hourly_records")
-            }
-            prov_ids = provenance_cloud_ids(reader) & esp_ids
-            cloud_keys = set()
-            divergent = []
-            if "cloud_hourly_records" in cloud_tables:
-                cloud_keys = {
-                    row[0]
-                    for row in reader.execute(
-                        "SELECT hour_end_epoch FROM cloud_hourly_records"
-                    )
-                }
-                for row in reader.execute(
-                    "SELECT h.record_id AS rid, "
-                    "h.consumption_delta_import_millikwh AS esp_c, "
-                    "h.generation_delta_export_millikwh AS esp_g, "
-                    "c.consumption_millikwh AS cloud_c, "
-                    "c.generation_millikwh AS cloud_g, "
-                    "c.hour_end_utc AS hour_end FROM hourly_records h "
-                    "JOIN cloud_hourly_records c "
-                    "ON c.hour_end_epoch = h.record_id"
-                ):
-                    if row["rid"] in prov_ids:
-                        continue
-                    for quantity, cloud_v, esp_v in (
-                        ("consumption", row["cloud_c"], row["esp_c"]),
-                        ("generation", row["cloud_g"], row["esp_g"]),
-                    ):
-                        if is_divergent(cloud_v, esp_v):
-                            divergent.append(
-                                {
-                                    "hour_end_utc": row["hour_end"],
-                                    "quantity": quantity,
-                                    "cloud_kwh": _millikwh_str(cloud_v),
-                                    "esp32_kwh": _millikwh_str(esp_v),
-                                    "pct_difference": pct_difference(cloud_v, esp_v),
-                                }
-                            )
-            # Worst first: an undefined percentage (zero cloud value
-            # with a real difference) outranks any finite percentage.
-            divergent.sort(
-                key=lambda item: (
-                    0 if item["pct_difference"] is None else 1,
-                    -(item["pct_difference"] or 0.0),
-                    item["hour_end_utc"],
-                    item["quantity"],
+                state_columns = _table_columns(reader, "cloud_sync_state")
+                wanted = (
+                    "sensor_id",
+                    "harvest_from_utc",
+                    "harvest_through_utc",
+                    "harvest_complete",
+                    "last_attempt_at_utc",
+                    "last_success_at_utc",
+                    "last_error",
+                    "last_error_at_utc",
+                    "backoff_until_utc",
                 )
-            )
-            merge = {
-                "counts": {
-                    "neurio": len(prov_ids | cloud_keys),
-                    "esp32": len(esp_ids - prov_ids - cloud_keys),
-                },
-                "divergence_count": len(divergent),
-                "divergent_hours": len({item["hour_end_utc"] for item in divergent}),
-                "worst_divergent": divergent[:10],
-            }
+                selected = [name for name in wanted if name in state_columns]
+                state_row = None
+                if selected:
+                    state_row = reader.execute(
+                        "SELECT " + ", ".join(selected) + " FROM cloud_sync_state WHERE id=1"
+                    ).fetchone()
+                if state_row is not None:
+                    if cloud["sensor_id"] is None and "sensor_id" in selected:
+                        cloud["sensor_id"] = state_row["sensor_id"]
+                    for name in (
+                        "harvest_from_utc",
+                        "harvest_through_utc",
+                        "last_attempt_at_utc",
+                        "last_success_at_utc",
+                        "last_error",
+                        "last_error_at_utc",
+                        "backoff_until_utc",
+                    ):
+                        if name in selected:
+                            cloud[name] = state_row[name]
+                    if "harvest_complete" in selected:
+                        cloud["harvest_complete"] = bool(state_row["harvest_complete"])
+                    cloud["backing_off"] = _backing_off(cloud["backoff_until_utc"], now)
         finally:
             reader.close()
     except sqlite3.Error:
         db_ok = False
+    # The merge summary is a separate read. A bad provenance schema, or
+    # any other sqlite failure while summarizing the union, must not flip
+    # db_ok or /readyz: the recorder's own hourly store is fine.
+    if db_ok:
+        merge = _load_merge(db)
     fresh, age = _hourly_fresh(
         cfg,
         db if db_ok else None,
@@ -405,16 +371,22 @@ def list_merged_hourly_records(cfg: Config, db, query: dict) -> dict:
     """The dual-source merged view (?view=merged): the union of the
     bridge's hourly_records and the cloud's cloud_hourly_records, keyed
     by hour-end epoch, cloud-preferred per hour. Read-time only — the
-    stored tables are never touched."""
+    stored tables are never touched.
+
+    ``imported_kwh`` / ``exported_kwh`` are per-hour grid energy on every
+    row. ``net_import_counter_kwh`` / ``net_export_counter_kwh`` are
+    lifetime counters. The default listing's ``net_import_kwh`` /
+    ``net_export_kwh`` names are not used here, because on that route
+    they are the lifetime counters.
+    """
     limit, cursor = _page(query)
+    # Provenance is its own read. A table that does not match the live
+    # column list degrades to "no provenance" instead of failing the
+    # request; /api/v1/status reports merge.error for the same condition.
+    prov = _provenance_or_empty(db)
     reader = db.reader()
     try:
         tables = existing_tables(reader)
-        prov_ids = (
-            provenance_cloud_ids(reader)
-            if "hourly_backfill_provenance" in tables
-            else set()
-        )
         if "cloud_hourly_records" in tables:
             key_rows = reader.execute(
                 "SELECT k FROM (SELECT record_id AS k FROM hourly_records "
@@ -439,8 +411,8 @@ def list_merged_hourly_records(cfg: Config, db, query: dict) -> dict:
                 row["record_id"]: dict(row)
                 for row in reader.execute(
                     "SELECT record_id, device_timestamp_raw, device_timestamp_utc, "
-                    "retries, received_at_utc, acked_at_utc, net_import_millikwh, "
-                    "net_export_millikwh, net_delta_net_millikwh, "
+                    "retries, received_at_utc, acked_at_utc, raw_json, "
+                    "net_import_millikwh, net_export_millikwh, net_delta_net_millikwh, "
                     "generation_delta_export_millikwh, "
                     "consumption_delta_import_millikwh, "
                     "phase_a_delta_import_millikwh, phase_b_delta_import_millikwh "
@@ -462,7 +434,7 @@ def list_merged_hourly_records(cfg: Config, db, query: dict) -> dict:
     finally:
         reader.close()
     records = [
-        _merged_record(key, esp_rows.get(key), cloud_rows.get(key), key in prov_ids)
+        _merged_record(key, esp_rows.get(key), cloud_rows.get(key), prov.get(key))
         for key in keys
     ]
     return {
@@ -471,7 +443,14 @@ def list_merged_hourly_records(cfg: Config, db, query: dict) -> dict:
     }
 
 
-def _merged_record(key, esp, cloud, prov_cloud: bool) -> dict:
+def _merged_record(key, esp, cloud, prov_source: str | None) -> dict:
+    """One merged hour.
+
+    ``imported_kwh`` and ``exported_kwh`` are per-hour on every row (null
+    when that hour has no per-hour import or export). ``net_import_counter_kwh``
+    and ``net_export_counter_kwh`` are lifetime registers. Cloud stats win
+    the per-hour fields when ``cloud_hourly_records`` has the hour.
+    """
     if esp is not None:
         record = {
             "record_id": esp["record_id"],
@@ -480,8 +459,6 @@ def _merged_record(key, esp, cloud, prov_cloud: bool) -> dict:
             "retries": esp["retries"],
             "received_at_utc": esp["received_at_utc"],
             "acked_at_utc": esp["acked_at_utc"],
-            "net_import_kwh": _millikwh_str(esp["net_import_millikwh"]),
-            "net_export_kwh": _millikwh_str(esp["net_export_millikwh"]),
             "net_delta_net_kwh": _millikwh_str(esp["net_delta_net_millikwh"]),
             "generation_delta_export_kwh": _millikwh_str(
                 esp["generation_delta_export_millikwh"]
@@ -506,14 +483,18 @@ def _merged_record(key, esp, cloud, prov_cloud: bool) -> dict:
             "retries": 0,
             "received_at_utc": cloud["fetched_at_utc"],
             "acked_at_utc": None,
-            "net_import_kwh": None,
-            "net_export_kwh": None,
             "net_delta_net_kwh": None,
             "generation_delta_export_kwh": None,
             "consumption_delta_import_kwh": None,
             "phase_a_delta_import_kwh": None,
             "phase_b_delta_import_kwh": None,
         }
+    imported, exported = _per_hour_import_export(esp, cloud, prov_source)
+    counter_import, counter_export = _lifetime_counters(esp, prov_source)
+    record["imported_kwh"] = _millikwh_str(imported)
+    record["exported_kwh"] = _millikwh_str(exported)
+    record["net_import_counter_kwh"] = _millikwh_str(counter_import)
+    record["net_export_counter_kwh"] = _millikwh_str(counter_export)
     if cloud is not None:
         record["origin"] = "neurio"
         if cloud["consumption_millikwh"] is not None:
@@ -524,15 +505,11 @@ def _merged_record(key, esp, cloud, prov_cloud: bool) -> dict:
             record["generation_delta_export_kwh"] = _millikwh_str(
                 cloud["generation_millikwh"]
             )
-        if cloud["imported_millikwh"] is not None:
-            record["net_import_kwh"] = _millikwh_str(cloud["imported_millikwh"])
-        if cloud["exported_millikwh"] is not None:
-            record["net_export_kwh"] = _millikwh_str(cloud["exported_millikwh"])
         if cloud["imported_millikwh"] is not None and cloud["exported_millikwh"] is not None:
             record["net_delta_net_kwh"] = _millikwh_str(
                 cloud["imported_millikwh"] - cloud["exported_millikwh"]
             )
-        if esp is not None and not prov_cloud:
+        if esp is not None and prov_source is None:
             record["esp32_consumption_kwh"] = _millikwh_str(
                 esp["consumption_delta_import_millikwh"]
             )
@@ -547,12 +524,191 @@ def _merged_record(key, esp, cloud, prov_cloud: bool) -> dict:
                 cloud["generation_millikwh"],
                 esp["generation_delta_export_millikwh"],
             )
-    elif prov_cloud:
-        # A backfill-provenance row inside hourly_records is cloud data.
+    elif prov_source is not None:
+        # A backfill row inside hourly_records is cloud data, not the board.
         record["origin"] = "neurio"
     else:
         record["origin"] = "esp32"
     return record
+
+
+def _per_hour_import_export(esp, cloud, prov_source):
+    """Per-hour grid import and export, in milli-kWh, or None.
+
+    A cloud-table row wins, including when its value is null: the board's
+    lifetime counter must not leak into this field. A ``neurio_cloud_stats``
+    backfill row stored the interval import/export in the net columns.
+    A board row (and an HA-counter row) publishes the per-hour split only
+    as ``net.delta_import_kwh`` / ``net.delta_export_kwh`` in the raw payload.
+    """
+    if cloud is not None:
+        return cloud["imported_millikwh"], cloud["exported_millikwh"]
+    if esp is None:
+        return None, None
+    if prov_source == CLOUD_STATS_SOURCE:
+        return esp["net_import_millikwh"], esp["net_export_millikwh"]
+    return _payload_net_deltas(esp.get("raw_json"))
+
+
+def _lifetime_counters(esp, prov_source):
+    """Lifetime net import/export registers, in milli-kWh.
+
+    Present for a board row and for an HA-counter snapshot. Absent for a
+    cloud-only hour and for a ``neurio_cloud_stats`` row, whose net columns
+    are per-hour interval energy rather than a running counter.
+    """
+    if esp is None or prov_source == CLOUD_STATS_SOURCE:
+        return None, None
+    return esp["net_import_millikwh"], esp["net_export_millikwh"]
+
+
+def _payload_net_deltas(raw_json):
+    """``net.delta_import_kwh`` / ``net.delta_export_kwh`` from a stored payload.
+
+    The bridge publishes those per-hour deltas next to the lifetime
+    counters. They are not columns. A payload that does not carry them
+    yields None rather than the lifetime counter.
+    """
+    if not isinstance(raw_json, str) or not raw_json:
+        return None, None
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    net = data.get("net")
+    if not isinstance(net, dict):
+        return None, None
+    return (
+        _kwh_number_to_millikwh(net.get("delta_import_kwh")),
+        _kwh_number_to_millikwh(net.get("delta_export_kwh")),
+    )
+
+
+def _kwh_number_to_millikwh(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return round(value * 1000)
+
+
+def _empty_merge() -> dict:
+    return {
+        "counts": {"neurio": None, "esp32": None},
+        "divergence_count": None,
+        "divergent_hours": None,
+        "worst_divergent": [],
+        "error": None,
+    }
+
+
+def _load_merge(db) -> dict:
+    """Merge summary, or an error object that leaves the recorder healthy.
+
+    sqlite3.Error here is the merge section's own problem (the live
+    failure was ``no such column: backfill_source``). It is not a failure
+    of hourly_records, so the caller keeps db_ok true.
+    """
+    try:
+        reader = db.reader()
+        try:
+            return _merge_status(reader)
+        finally:
+            reader.close()
+    except sqlite3.Error:
+        failed = _empty_merge()
+        failed["error"] = "merge_unavailable"
+        return failed
+
+
+def _merge_status(reader) -> dict:
+    """Stored hours by origin, plus divergence between board and cloud rows."""
+    esp_ids = {
+        row[0] for row in reader.execute("SELECT record_id FROM hourly_records")
+    }
+    prov = provenance_by_record(reader)
+    prov_ids = set(prov) & esp_ids
+    cloud_tables = existing_tables(reader)
+    cloud_keys = set()
+    divergent = []
+    if "cloud_hourly_records" in cloud_tables:
+        cloud_keys = {
+            row[0]
+            for row in reader.execute(
+                "SELECT hour_end_epoch FROM cloud_hourly_records"
+            )
+        }
+        for row in reader.execute(
+            "SELECT h.record_id AS rid, "
+            "h.consumption_delta_import_millikwh AS esp_c, "
+            "h.generation_delta_export_millikwh AS esp_g, "
+            "c.consumption_millikwh AS cloud_c, "
+            "c.generation_millikwh AS cloud_g, "
+            "c.hour_end_utc AS hour_end FROM hourly_records h "
+            "JOIN cloud_hourly_records c "
+            "ON c.hour_end_epoch = h.record_id"
+        ):
+            if row["rid"] in prov_ids:
+                continue
+            for quantity, cloud_v, esp_v in (
+                ("consumption", row["cloud_c"], row["esp_c"]),
+                ("generation", row["cloud_g"], row["esp_g"]),
+            ):
+                if is_divergent(cloud_v, esp_v):
+                    divergent.append(
+                        {
+                            "hour_end_utc": row["hour_end"],
+                            "quantity": quantity,
+                            "cloud_kwh": _millikwh_str(cloud_v),
+                            "esp32_kwh": _millikwh_str(esp_v),
+                            "pct_difference": pct_difference(cloud_v, esp_v),
+                        }
+                    )
+    # Worst first: an undefined percentage (zero cloud value
+    # with a real difference) outranks any finite percentage.
+    divergent.sort(
+        key=lambda item: (
+            0 if item["pct_difference"] is None else 1,
+            -(item["pct_difference"] or 0.0),
+            item["hour_end_utc"],
+            item["quantity"],
+        )
+    )
+    summary = _empty_merge()
+    summary["counts"] = {
+        "neurio": len(prov_ids | cloud_keys),
+        "esp32": len(esp_ids - prov_ids - cloud_keys),
+    }
+    summary["divergence_count"] = len(divergent)
+    summary["divergent_hours"] = len({item["hour_end_utc"] for item in divergent})
+    summary["worst_divergent"] = divergent[:10]
+    return summary
+
+
+def _provenance_or_empty(db) -> dict:
+    try:
+        reader = db.reader()
+        try:
+            return provenance_by_record(reader)
+        finally:
+            reader.close()
+    except sqlite3.Error:
+        return {}
+
+
+def _table_columns(reader, table: str) -> set:
+    return {row["name"] for row in reader.execute(f"PRAGMA table_info({table})")}
+
+
+def _backing_off(until_text, now: datetime) -> bool:
+    if not until_text:
+        return False
+    try:
+        return parse_instant(until_text) > now
+    except ValueError:
+        return False
 
 
 def _ready(cfg: Config, db, poller, now: datetime):

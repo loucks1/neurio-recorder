@@ -20,7 +20,7 @@ from neurio_collector.cloud_ingest import (
     store_cloud_hours,
     ws_to_millikwh,
 )
-from neurio_collector.cloud_sync import CloudSyncer
+from neurio_collector.cloud_sync import CloudSyncer, _backoff_seconds
 from neurio_collector.config import Config, ConfigError, Secret
 from neurio_collector.mqtt_ingest import store_hourly_record
 from neurio_collector.timeutil import format_utc, parse_instant
@@ -77,6 +77,12 @@ class FakeCloud:
         self.stats_windows = []
         self.fail_stats = False
         self.fail_once_at = None
+        self.rate_limit_once_at = None
+        self.rate_limit_body = b""
+        self.rate_limit_headers = {}
+        self.http_error = None
+        self.stop_after_stats = None
+        self.on_stop = None
         self.sensor_id = "sensor-123"
 
     def __call__(self, method, url, headers, body, timeout):
@@ -101,11 +107,23 @@ class FakeCloud:
             start = int(parse_instant(query["start"][0]).timestamp())
             end = int(parse_instant(query["end"][0]).timestamp())
             self.stats_windows.append((start, end))
+            if self.stop_after_stats is not None and len(self.stats_windows) >= self.stop_after_stats:
+                if self.on_stop is not None:
+                    self.on_stop()
+            if self.http_error is not None:
+                status, body, headers = self.http_error
+                self.http_error = None
+                if headers is None:
+                    return status, body
+                return status, body, headers
             if self.fail_stats:
                 raise CloudError("connection_error")
             if self.fail_once_at is not None and start == self.fail_once_at:
                 self.fail_once_at = None
                 raise CloudError("boom")
+            if self.rate_limit_once_at is not None and start == self.rate_limit_once_at:
+                self.rate_limit_once_at = None
+                return 429, self.rate_limit_body, self.rate_limit_headers
             items = []
             for end_epoch in sorted(self.hours):
                 item_start = end_epoch - 3600
@@ -154,6 +172,37 @@ class CloudConfigTests(unittest.TestCase):
         self.assertEqual(cfg.cloud_api_base, "https://api.neur.io/v1")
         self.assertEqual(cfg.cloud_tail_hours, 48)
         self.assertEqual(cfg.cloud_sync_interval_seconds, 3600.0)
+        self.assertEqual(cfg.cloud_max_requests_per_hour, 72)
+        self.assertEqual(cfg.cloud_request_interval_seconds, 50.0)
+
+    def test_request_budget_stays_inside_the_published_limit(self):
+        with self.assertRaises(ConfigError):
+            Config.from_env(
+                {
+                    **DEVICE_ENV,
+                    "NEURIO_CLIENT_ID": "abc",
+                    "NEURIO_CLIENT_SECRET": "def",
+                    "NEURIO_CLOUD_MAX_REQUESTS_PER_HOUR": "0",
+                }
+            )
+        with self.assertRaises(ConfigError):
+            Config.from_env(
+                {
+                    **DEVICE_ENV,
+                    "NEURIO_CLIENT_ID": "abc",
+                    "NEURIO_CLIENT_SECRET": "def",
+                    "NEURIO_CLOUD_MAX_REQUESTS_PER_HOUR": "145",
+                }
+            )
+        cfg = Config.from_env(
+            {
+                **DEVICE_ENV,
+                "NEURIO_CLIENT_ID": "abc",
+                "NEURIO_CLIENT_SECRET": "def",
+                "NEURIO_CLOUD_MAX_REQUESTS_PER_HOUR": "100",
+            }
+        )
+        self.assertEqual(cfg.cloud_request_interval_seconds, 36.0)
 
     def test_api_base_http_only_for_loopback(self):
         with self.assertRaises(ConfigError):
@@ -266,6 +315,75 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(CloudError):
             self._client(transport).get_hourly_stats("s", NOW, NOW)
 
+    def test_429_parses_reset_and_drops_the_body(self):
+        secret = "super-secret-value"
+
+        def transport(method, url, headers, body, timeout):
+            if url.endswith("/oauth2/token"):
+                return 200, b'{"access_token": "t", "expires_in": 3600}'
+            raw = (
+                '{"code":"rate_limit_exceeding","message":"The user exceeds 144 '
+                "rate limit. The remaining time to reset the limit is 15000 "
+                f'milliseconds","access_token":"{secret}"}}'
+            ).encode()
+            return 429, raw, {"RateLimit-Reset": "1"}
+
+        with self.assertRaises(CloudError) as caught:
+            self._client(transport).get_hourly_stats("s", NOW, NOW)
+        self.assertEqual(caught.exception.status, 429)
+        self.assertEqual(caught.exception.retry_after_ms, 15000)
+        self.assertIn("rate_limit_exceeding", str(caught.exception))
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn("exceeds 144", str(caught.exception))
+
+    def test_429_header_reset_when_the_body_has_no_sentence(self):
+        def transport(method, url, headers, body, timeout):
+            if url.endswith("/oauth2/token"):
+                return 200, b'{"access_token": "t", "expires_in": 3600}'
+            return 429, b'{"code":"rate_limit_exceeding"}', {"RateLimit-Reset": "2500"}
+
+        with self.assertRaises(CloudError) as caught:
+            self._client(transport).get_hourly_stats("s", NOW, NOW)
+        self.assertEqual(caught.exception.retry_after_ms, 2500)
+
+    def test_429_plain_sentence_and_missing_reset(self):
+        def sentence(method, url, headers, body, timeout):
+            if url.endswith("/oauth2/token"):
+                return 200, b'{"access_token": "t", "expires_in": 3600}'
+            return (
+                429,
+                b"The user exceeds 144 rate limit. The remaining time to reset the limit is 42 milliseconds",
+            )
+
+        with self.assertRaises(CloudError) as caught:
+            self._client(sentence).get_hourly_stats("s", NOW, NOW)
+        self.assertEqual(caught.exception.retry_after_ms, 42)
+        self.assertEqual(str(caught.exception), "rate_limit_exceeding; retry after 42 ms")
+
+        def bare(method, url, headers, body, timeout):
+            if url.endswith("/oauth2/token"):
+                return 200, b'{"access_token": "t", "expires_in": 3600}'
+            return 429, b'{"code":"rate_limit_exceeding"}'
+
+        with self.assertRaises(CloudError) as caught:
+            self._client(bare).get_hourly_stats("s", NOW, NOW)
+        self.assertIsNone(caught.exception.retry_after_ms)
+        self.assertEqual(_backoff_seconds(None), 3600.0)
+        self.assertEqual(_backoff_seconds(10**12), 3600.0)
+        self.assertEqual(_backoff_seconds(0), 0.0)
+
+    def test_other_http_errors_keep_only_a_short_code(self):
+        def transport(method, url, headers, body, timeout):
+            if url.endswith("/oauth2/token"):
+                return 200, b'{"access_token": "t", "expires_in": 3600}'
+            return 500, b'{"code":"server_error","token":"super-secret-value","message":"raw body"}'
+
+        with self.assertRaises(CloudError) as caught:
+            self._client(transport).get_hourly_stats("s", NOW, NOW)
+        self.assertEqual(str(caught.exception), "request failed (500): server_error")
+        self.assertNotIn("super-secret-value", str(caught.exception))
+        self.assertNotIn("raw body", str(caught.exception))
+
 
 class SyncTests(unittest.TestCase):
     def test_cloud_tables_are_created_lazily_on_first_sync(self):
@@ -289,9 +407,15 @@ class SyncTests(unittest.TestCase):
         self.assertIn("cloud_hourly_records", names)
         self.assertIn("cloud_sync_state", names)
 
-    def _syncer(self, db, cfg, cloud, clock_holder):
+    def _syncer(self, db, cfg, cloud, clock_holder, sleeper=None):
         client = NeurioCloudClient(cfg, transport=cloud)
-        return CloudSyncer(cfg, db, client=client, clock=lambda: clock_holder[0])
+        return CloudSyncer(
+            cfg,
+            db,
+            client=client,
+            clock=lambda: clock_holder[0],
+            sleeper=sleeper or (lambda _seconds: False),
+        )
 
     def test_harvest_and_tail_store_hours(self):
         db = support.open_db(self)
@@ -446,6 +570,177 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(row["hour_end_utc"], "2026-03-08T08:00:00.000Z")
 
 
+    def test_harvest_paces_between_chunks(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db, cloud_sensor_id="sensor-123")
+        first_end = int(parse_instant("2026-10-17T01:00:00Z").timestamp())
+        cloud = FakeCloud(hourly_dataset(first_end, 24 * 25))
+        waits = []
+
+        def sleeper(seconds):
+            waits.append(seconds)
+            return False
+
+        self._syncer(db, cfg, cloud, [NOW], sleeper=sleeper).run_cycle()
+        # 3 harvest chunks plus one tail chunk: a gap before every call but the first.
+        self.assertEqual(waits, [50.0, 50.0, 50.0])
+        self.assertEqual(len(cloud.stats_windows), 4)
+        self.assertEqual(read_sync_state(db)["harvest_complete"], 1)
+
+    def test_429_backs_off_and_resumes_without_the_body(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db, cloud_sensor_id="sensor-123")
+        first_end = int(parse_instant("2026-10-17T01:00:00Z").timestamp())
+        cloud = FakeCloud(hourly_dataset(first_end, 24 * 25))
+        floor = int(parse_instant("2026-10-17T00:00:00Z").timestamp())
+        cloud.rate_limit_once_at = floor + 10 * 86400
+        cloud.rate_limit_body = (
+            b'{"code":"rate_limit_exceeding","message":"The user exceeds 144 '
+            b'rate limit. The remaining time to reset the limit is 15000 milliseconds",'
+            b'"token":"super-secret-value"}'
+        )
+        cloud.rate_limit_headers = {"RateLimit-Reset": "15000"}
+        waits = []
+
+        def sleeper(seconds):
+            waits.append(seconds)
+            return False
+
+        self._syncer(db, cfg, cloud, [NOW], sleeper=sleeper).run_cycle()
+        self.assertIn(15.0, waits)
+        state = read_sync_state(db)
+        self.assertEqual(state["harvest_complete"], 1)
+        self.assertIsNone(state["last_error"])
+        self.assertIsNone(state["backoff_until_utc"])
+        status, body, _ = dispatch("/api/v1/status", cfg, db, None, NOW)
+        self.assertEqual(status, 200)
+        encoded = json.dumps(body)
+        self.assertNotIn("super-secret-value", encoded)
+        self.assertNotIn("exceeds 144", encoded)
+        self.assertFalse(body["cloud_ingest"]["backing_off"])
+        self.assertEqual(body["cloud_ingest"]["max_requests_per_hour"], 72)
+        self.assertEqual(body["cloud_ingest"]["min_request_interval_seconds"], 50.0)
+        self.assertEqual(body["cloud_ingest"]["published_limit_per_hour"], 144)
+
+    def test_429_stop_during_backoff_is_sanitized_and_visible(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db, cloud_sensor_id="sensor-123")
+        first_end = int(parse_instant("2026-10-17T01:00:00Z").timestamp())
+        cloud = FakeCloud(hourly_dataset(first_end, 24))
+        floor = int(parse_instant("2026-10-17T00:00:00Z").timestamp())
+        cloud.rate_limit_once_at = floor
+        cloud.rate_limit_body = (
+            b'{"code":"rate_limit_exceeding","message":"The user exceeds 144 '
+            b'rate limit. The remaining time to reset the limit is 15000 milliseconds",'
+            b'"token":"super-secret-value"}'
+        )
+        waits = []
+
+        def sleeper(seconds):
+            waits.append(seconds)
+            return seconds == 15.0
+
+        syncer = self._syncer(db, cfg, cloud, [NOW], sleeper=sleeper)
+        syncer.run_cycle()
+        self.assertEqual(waits, [15.0])
+        state = read_sync_state(db)
+        self.assertEqual(state["harvest_complete"], 0)
+        self.assertEqual(state["last_error"], "CloudError: rate_limit_exceeding")
+        self.assertNotIn("super-secret", state["last_error"])
+        status, body, _ = dispatch("/api/v1/status", cfg, db, None, NOW)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["db_ok"])
+        section = body["cloud_ingest"]
+        self.assertTrue(section["backing_off"])
+        self.assertEqual(section["backoff_until_utc"], format_utc(NOW + timedelta(seconds=15)))
+        self.assertEqual(section["last_error"], "CloudError: rate_limit_exceeding")
+        self.assertNotIn("super-secret-value", json.dumps(body))
+        self.assertNotIn("exceeds 144", json.dumps(body))
+
+    def test_zero_reset_waits_one_pace_interval_instead_of_spinning(self):
+        db = support.open_db(self)
+        cfg = cloud_config(
+            db,
+            cloud_sensor_id="sensor-123",
+            cloud_harvest_from="2026-11-11T00:00:00Z",
+        )
+        cloud = FakeCloud({})
+        cloud.rate_limit_once_at = int(parse_instant("2026-11-11T00:00:00Z").timestamp())
+        cloud.rate_limit_body = (
+            b'{"code":"rate_limit_exceeding","message":"The user exceeds 144 '
+            b'rate limit. The remaining time to reset the limit is 0 milliseconds"}'
+        )
+        waits = []
+
+        def sleeper(seconds):
+            waits.append(seconds)
+            return seconds >= 50
+
+        self._syncer(db, cfg, cloud, [NOW], sleeper=sleeper).run_cycle()
+        self.assertEqual(waits, [50.0])
+        self.assertEqual(
+            read_sync_state(db)["last_error"], "CloudError: rate_limit_exceeding"
+        )
+
+    def test_stop_between_chunks_does_not_continue(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db, cloud_sensor_id="sensor-123")
+        first_end = int(parse_instant("2026-10-17T01:00:00Z").timestamp())
+        cloud = FakeCloud(hourly_dataset(first_end, 24 * 25))
+        syncer = self._syncer(db, cfg, cloud, [NOW])
+        cloud.stop_after_stats = 1
+        cloud.on_stop = syncer._stop.set
+        syncer.run_cycle()
+        self.assertEqual(len(cloud.stats_windows), 1)
+        state = read_sync_state(db)
+        self.assertEqual(state["harvest_complete"], 0)
+        floor = int(parse_instant("2026-10-17T00:00:00Z").timestamp())
+        self.assertEqual(
+            int(parse_instant(state["harvest_through_utc"]).timestamp()),
+            floor + 10 * 86400,
+        )
+
+    def test_persisted_backoff_is_honored_before_the_next_request(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db, cloud_sensor_id="sensor-123")
+        from neurio_collector.cloud_ingest import update_sync_state
+
+        update_sync_state(
+            db, backoff_until_utc=format_utc(NOW + timedelta(seconds=30))
+        )
+        first_end = int(parse_instant("2026-10-17T01:00:00Z").timestamp())
+        cloud = FakeCloud(hourly_dataset(first_end, 4))
+        waits = []
+
+        def sleeper(seconds):
+            waits.append(seconds)
+            return False
+
+        self._syncer(db, cfg, cloud, [NOW], sleeper=sleeper).run_cycle()
+        self.assertAlmostEqual(waits[0], 30.0, places=3)
+        self.assertGreater(len(cloud.stats_windows), 0)
+
+    def test_http_error_body_is_not_stored(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db, cloud_sensor_id="sensor-123")
+        cloud = FakeCloud({})
+        cloud.http_error = (
+            500,
+            b'{"code":"server_error","token":"super-secret-value","message":"raw body"}',
+            None,
+        )
+        self._syncer(db, cfg, cloud, [NOW]).run_cycle()
+        state = read_sync_state(db)
+        self.assertEqual(state["last_error"], "CloudError: request failed (500): server_error")
+        status, body, _ = dispatch("/api/v1/status", cfg, db, None)
+        self.assertNotIn("super-secret-value", json.dumps(body))
+        self.assertNotIn("raw body", json.dumps(body))
+        self.assertEqual(
+            body["cloud_ingest"]["last_error"],
+            "CloudError: request failed (500): server_error",
+        )
+
+
 class StatusTests(unittest.TestCase):
     def test_status_cloud_section_unconfigured(self):
         db = support.open_db(self)
@@ -457,6 +752,11 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(section["hours_stored"], 0)
         self.assertFalse(section["harvest_complete"])
         self.assertIsNone(section["newest_hour_end_utc"])
+        self.assertEqual(section["published_limit_per_hour"], 144)
+        self.assertEqual(section["max_requests_per_hour"], 72)
+        self.assertEqual(section["min_request_interval_seconds"], 50.0)
+        self.assertFalse(section["backing_off"])
+        self.assertIsNone(section["backoff_until_utc"])
 
     def test_status_cloud_section_after_sync(self):
         db = support.open_db(self)
@@ -464,7 +764,9 @@ class StatusTests(unittest.TestCase):
         first_end = int(parse_instant("2026-10-17T01:00:00Z").timestamp())
         cloud = FakeCloud(hourly_dataset(first_end, 24 * 25))
         client = NeurioCloudClient(cfg, transport=cloud)
-        CloudSyncer(cfg, db, client=client, clock=lambda: NOW).run_cycle()
+        CloudSyncer(
+            cfg, db, client=client, clock=lambda: NOW, sleeper=lambda _seconds: False
+        ).run_cycle()
         status, body, _ = dispatch("/api/v1/status", cfg, db, None)
         self.assertEqual(status, 200)
         section = body["cloud_ingest"]
@@ -476,6 +778,33 @@ class StatusTests(unittest.TestCase):
             section["newest_hour_end_utc"], iso(first_end + 3600 * (24 * 25 - 1))
         )
         self.assertIsNotNone(section["last_success_at_utc"])
+        self.assertEqual(section["max_requests_per_hour"], 72)
+        self.assertFalse(section["backing_off"])
+        self.assertIsNone(body["merge"]["error"])
+
+    def test_status_tolerates_cloud_state_from_before_pacing(self):
+        db = support.open_db(self)
+        cfg = support.make_config(data_dir=db.path.rsplit("/", 1)[0])
+        db.conn.execute(
+            "CREATE TABLE cloud_sync_state ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "sensor_id TEXT, harvest_from_utc TEXT, harvest_through_utc TEXT, "
+            "harvest_complete INTEGER NOT NULL DEFAULT 0, "
+            "last_attempt_at_utc TEXT, last_success_at_utc TEXT, "
+            "last_error TEXT, last_error_at_utc TEXT)"
+        )
+        db.conn.execute(
+            "INSERT INTO cloud_sync_state(id, harvest_complete, last_error) "
+            "VALUES(1, 0, 'CloudError: connection_error')"
+        )
+        status, body, _ = dispatch("/api/v1/status", cfg, db, None)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["db_ok"])
+        section = body["cloud_ingest"]
+        self.assertEqual(section["last_error"], "CloudError: connection_error")
+        self.assertFalse(section["backing_off"])
+        self.assertIsNone(section["backoff_until_utc"])
+        self.assertEqual(section["published_limit_per_hour"], 144)
 
 
 class LoopbackServerTests(unittest.TestCase):
@@ -527,7 +856,7 @@ class LoopbackServerTests(unittest.TestCase):
                 cloud_harvest_from="2026-11-11T00:00:00Z",
                 cloud_sensor_id="wire-1",
             )
-            CloudSyncer(cfg, db, clock=lambda: NOW).run_cycle()
+            CloudSyncer(cfg, db, clock=lambda: NOW, sleeper=lambda _seconds: False).run_cycle()
         finally:
             server.shutdown()
             server.server_close()

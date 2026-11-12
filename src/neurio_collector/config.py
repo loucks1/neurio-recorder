@@ -20,6 +20,13 @@ from .timeutil import parse_instant
 
 
 WILDCARD_OPT_IN = "host-publish-pinned"
+# Neurio documents 144 authorized requests per hour, with RateLimit-Reset
+# counting down that window in milliseconds. The default budget is half of
+# that so rate-plan-tool's cloud fallback, token refresh, and any other
+# client on the same credentials still have room. The window is one hour.
+CLOUD_PUBLISHED_LIMIT_PER_HOUR = 144
+CLOUD_RATE_WINDOW_SECONDS = 3600.0
+CLOUD_DEFAULT_MAX_REQUESTS_PER_HOUR = 72
 _REMOVED_ENV = (
     "NEURIO_URL",
     "HA_URL",
@@ -77,6 +84,7 @@ class Config:
     cloud_tail_hours: int = 48
     cloud_harvest_from: str | None = None
     cloud_timeout_seconds: float = 30.0
+    cloud_max_requests_per_hour: int = CLOUD_DEFAULT_MAX_REQUESTS_PER_HOUR
     poll_interval_seconds: float = 15.0
     poll_timeout_seconds: float = 3.0
     poll_max_backoff_seconds: float = 300.0
@@ -109,6 +117,16 @@ class Config:
             and self.cloud_client_secret.reveal()
         )
 
+    @property
+    def cloud_request_interval_seconds(self) -> float:
+        """Minimum gap between cloud API calls for the configured budget.
+
+        The published window is one hour. Spacing calls evenly keeps a
+        multi-year harvest under the budget instead of bursting to the
+        429 and then idle-waiting for the sync interval.
+        """
+        return CLOUD_RATE_WINDOW_SECONDS / self.cloud_max_requests_per_hour
+
     def validate(self) -> None:
         _validate_bind(
             self.bind_address,
@@ -125,6 +143,7 @@ class Config:
             )
         validate_mqtt_settings(self)
         validate_cloud_settings(self)
+        _validate_cloud_request_budget(self.cloud_max_requests_per_hour)
         if not 0 < self.poll_interval_seconds <= 3600:
             raise ConfigError(
                 "NEURIO_POLL_INTERVAL_SECONDS must be > 0 and <= 3600. "
@@ -200,6 +219,11 @@ class Config:
             cloud_timeout_seconds=_optional_float(
                 values, "NEURIO_CLOUD_TIMEOUT_SECONDS", 30.0
             ),
+            cloud_max_requests_per_hour=_optional_int(
+                values,
+                "NEURIO_CLOUD_MAX_REQUESTS_PER_HOUR",
+                CLOUD_DEFAULT_MAX_REQUESTS_PER_HOUR,
+            ),
             poll_interval_seconds=_optional_float(values, "NEURIO_POLL_INTERVAL_SECONDS", 15.0),
             poll_timeout_seconds=_optional_float(values, "NEURIO_POLL_TIMEOUT_SECONDS", 3.0),
             poll_max_backoff_seconds=_optional_float(
@@ -238,6 +262,22 @@ def _read_secret(env: dict[str, str], file_key: str, inline_key: str) -> Secret 
     if inline:
         return Secret(inline)
     return None
+
+
+def _validate_cloud_request_budget(value) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= CLOUD_PUBLISHED_LIMIT_PER_HOUR
+    ):
+        raise ConfigError(
+            "NEURIO_CLOUD_MAX_REQUESTS_PER_HOUR must be an integer from 1 to "
+            f"{CLOUD_PUBLISHED_LIMIT_PER_HOUR} (Neurio's published hourly "
+            "limit for authorized calls). The default "
+            f"{CLOUD_DEFAULT_MAX_REQUESTS_PER_HOUR} leaves half of that "
+            "budget for other clients that share the credentials, including "
+            "rate-plan-tool's cloud fallback."
+        )
 
 
 def validate_cloud_settings(cfg: "Config") -> None:

@@ -12,6 +12,7 @@ unaffected.
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -23,11 +24,26 @@ from .timeutil import format_utc
 
 USER_AGENT = "neurio-lan-collector/1.0"
 
+# Neurio's 429 body says: "The user exceeds 144 rate limit. The remaining
+# time to reset the limit is N milliseconds." The code is rate_limit_exceeding.
+# RateLimit-Reset is the same remaining time, in milliseconds.
+_RESET_MS_RE = re.compile(
+    r"remaining time to reset the limit is\s+(\d+)\s+milliseconds",
+    re.IGNORECASE,
+)
+_SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
 
 class CloudError(Exception):
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        retry_after_ms: int | None = None,
+    ):
         super().__init__(message)
         self.status = status
+        self.retry_after_ms = retry_after_ms
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -35,23 +51,43 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirect_blocked", headers, fp)
 
 
+def _header_map(headers) -> dict:
+    if not headers:
+        return {}
+    mapped = {}
+    try:
+        pairs = headers.items()
+    except AttributeError:
+        pairs = headers
+    for key, value in pairs:
+        if key is None:
+            continue
+        mapped[str(key).lower()] = "" if value is None else str(value)
+    return mapped
+
+
 def _urllib_transport(method, url, headers, body, timeout):
-    """(method, url, headers, body, timeout) -> (status, response body).
+    """(method, url, headers, body, timeout) -> (status, body, header map).
 
     HTTP statuses are returned, not raised. Network failures raise
     CloudError so the sync loop can record them like any other failure.
+    Header names are lower-case. Response bodies are not logged.
     """
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     opener = urllib.request.build_opener(_NoRedirect)
     try:
         with opener.open(request, timeout=timeout) as response:
-            return getattr(response, "status", 200), response.read()
+            return (
+                getattr(response, "status", 200),
+                response.read(),
+                _header_map(response.headers),
+            )
     except urllib.error.HTTPError as exc:
         try:
             detail = exc.read()
         except Exception:
             detail = b""
-        return exc.code, detail
+        return exc.code, detail, _header_map(exc.headers)
     except TimeoutError as exc:
         raise CloudError("timeout") from exc
     except urllib.error.URLError as exc:
@@ -63,6 +99,80 @@ def _urllib_transport(method, url, headers, body, timeout):
         raise CloudError("connection_error") from exc
 
 
+def _unpack_transport(result):
+    """Accept (status, body) and (status, body, headers).
+
+    Tests and older fakes return a pair. The urllib transport returns
+    the header map as well so a 429 can carry RateLimit-Reset.
+    """
+    if isinstance(result, tuple) and len(result) == 3:
+        status, raw, headers = result
+        return status, raw if raw is not None else b"", _header_map(headers)
+    status, raw = result
+    return status, raw if raw is not None else b"", {}
+
+
+def _json_code(raw: bytes) -> str | None:
+    """A short error code from a JSON body, or None.
+
+    Only a single token is returned. Message text, nested objects, and
+    anything that could be a credential or a raw body are dropped.
+    """
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for key in ("code", "error"):
+        value = payload.get(key)
+        if isinstance(value, str) and _SAFE_CODE_RE.fullmatch(value):
+            return value
+    return None
+
+
+def _retry_after_ms(raw: bytes, headers: dict) -> int | None:
+    """Milliseconds until the rate-limit window resets, if the response says.
+
+    The body sentence is preferred. RateLimit-Reset is the same duration
+    in milliseconds (Neurio's documented header). An unparseable value is
+    absent, and the caller then waits out a full window.
+    """
+    if raw:
+        match = _RESET_MS_RE.search(raw.decode("utf-8", errors="replace"))
+        if match:
+            return int(match.group(1))
+    header = headers.get("ratelimit-reset") if headers else None
+    if header is not None and str(header).strip().isdigit():
+        return int(str(header).strip())
+    return None
+
+
+def _http_error(status: int, raw: bytes, headers: dict) -> CloudError:
+    """A CloudError whose message is safe to store and return.
+
+    The response body is not copied into the message. A 429 keeps the
+    parsed reset time on the exception so the syncer can sleep until
+    the window reopens.
+    """
+    if status == 429:
+        retry_after_ms = _retry_after_ms(raw, headers)
+        code = _json_code(raw) or "rate_limit_exceeding"
+        if not _SAFE_CODE_RE.fullmatch(code):
+            code = "rate_limit_exceeding"
+        if retry_after_ms is None:
+            message = code
+        else:
+            message = f"{code}; retry after {retry_after_ms} ms"
+        return CloudError(message, status, retry_after_ms)
+    code = _json_code(raw)
+    if code:
+        return CloudError(f"request failed ({status}): {code}", status)
+    return CloudError(f"request failed ({status})", status)
+
+
 class NeurioCloudClient:
     def __init__(self, cfg: Config, transport=None, now=None):
         self.cfg = cfg
@@ -72,12 +182,12 @@ class NeurioCloudClient:
         self._token_expires_at = 0.0
 
     def _request(self, method, url, headers, body):
-        status, raw = self._transport(
-            method, url, headers, body, self.cfg.cloud_timeout_seconds
+        status, raw, response_headers = _unpack_transport(
+            self._transport(method, url, headers, body, self.cfg.cloud_timeout_seconds)
         )
         if len(raw) > self.cfg.max_response_bytes:
             raise CloudError("response_too_large", status)
-        return status, raw
+        return status, raw, response_headers
 
     def _access_token(self, force: bool = False) -> str:
         if not force and self._token and self._now() < self._token_expires_at - 60:
@@ -91,7 +201,7 @@ class NeurioCloudClient:
                 else "",
             }
         ).encode("utf-8")
-        status, raw = self._request(
+        status, raw, response_headers = self._request(
             "POST",
             f"{self.cfg.cloud_api_base}/oauth2/token",
             {
@@ -101,6 +211,8 @@ class NeurioCloudClient:
             },
             form,
         )
+        if status == 429:
+            raise _http_error(status, raw, response_headers)
         if status != 200:
             raise CloudError(f"token request failed ({status})", status)
         try:
@@ -118,7 +230,7 @@ class NeurioCloudClient:
         return token
 
     def _get_json(self, url: str, retry: bool = True):
-        status, raw = self._request(
+        status, raw, response_headers = self._request(
             "GET",
             url,
             {
@@ -132,8 +244,7 @@ class NeurioCloudClient:
             self._access_token(force=True)
             return self._get_json(url, retry=False)
         if status != 200:
-            text = raw.decode("utf-8", errors="replace")[:300]
-            raise CloudError(f"request failed ({status}): {text}", status)
+            raise _http_error(status, raw, response_headers)
         try:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
