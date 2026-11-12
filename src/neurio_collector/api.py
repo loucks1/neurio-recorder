@@ -99,6 +99,20 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
         "last_received_at_utc": None,
         "last_acked_at_utc": None,
     }
+    cloud = {
+        "configured": cfg.cloud_configured,
+        "sensor_id": cfg.cloud_sensor_id,
+        "harvest_from_utc": None,
+        "harvest_through_utc": None,
+        "harvest_complete": False,
+        "last_attempt_at_utc": None,
+        "last_success_at_utc": None,
+        "last_error": None,
+        "last_error_at_utc": None,
+        "hours_stored": None,
+        "oldest_hour_end_utc": None,
+        "newest_hour_end_utc": None,
+    }
     try:
         reader = db.reader()
         try:
@@ -122,6 +136,42 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
                 "last_received_at_utc": agg["last_received"],
                 "last_acked_at_utc": agg["last_acked"],
             }
+            # The cloud tables are created lazily by cloud ingest, so a
+            # database that has never synced has no rows to report rather
+            # than an error to hide.
+            cloud_tables = {
+                row[0]
+                for row in reader.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name IN ('cloud_hourly_records', 'cloud_sync_state')"
+                )
+            }
+            if "cloud_hourly_records" in cloud_tables:
+                cloud_agg = reader.execute(
+                    "SELECT COUNT(*) AS n, MIN(hour_end_utc) AS oldest, "
+                    "MAX(hour_end_utc) AS newest FROM cloud_hourly_records"
+                ).fetchone()
+                cloud["hours_stored"] = cloud_agg["n"]
+                cloud["oldest_hour_end_utc"] = cloud_agg["oldest"]
+                cloud["newest_hour_end_utc"] = cloud_agg["newest"]
+            else:
+                cloud["hours_stored"] = 0
+            if "cloud_sync_state" in cloud_tables:
+                state_row = reader.execute(
+                    "SELECT sensor_id, harvest_from_utc, harvest_through_utc, "
+                    "harvest_complete, last_attempt_at_utc, last_success_at_utc, "
+                    "last_error, last_error_at_utc FROM cloud_sync_state WHERE id=1"
+                ).fetchone()
+                if state_row is not None:
+                    if cloud["sensor_id"] is None:
+                        cloud["sensor_id"] = state_row["sensor_id"]
+                    cloud["harvest_from_utc"] = state_row["harvest_from_utc"]
+                    cloud["harvest_through_utc"] = state_row["harvest_through_utc"]
+                    cloud["harvest_complete"] = bool(state_row["harvest_complete"])
+                    cloud["last_attempt_at_utc"] = state_row["last_attempt_at_utc"]
+                    cloud["last_success_at_utc"] = state_row["last_success_at_utc"]
+                    cloud["last_error"] = state_row["last_error"]
+                    cloud["last_error_at_utc"] = state_row["last_error_at_utc"]
         finally:
             reader.close()
     except sqlite3.Error:
@@ -159,6 +209,7 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
         "counts": {"hourly_records": hourly_count},
         "poll": snap,
         "hourly_records": hourly,
+        "cloud_ingest": cloud,
         "source_mode": cfg.source_mode,
         "mqtt_relay": {
             "broker_host": cfg.mqtt_broker_host,

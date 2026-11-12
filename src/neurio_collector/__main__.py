@@ -12,6 +12,7 @@ import signal
 import sys
 
 from .backup import BackupError, online_backup, restore_backup, verify_backup
+from .cloud_sync import CloudSyncer
 from .config import Config, ConfigError
 from .db import Database
 from .locking import InstanceLock, LockError
@@ -74,20 +75,30 @@ def _serve() -> int:
         return 2
     db = Database(cfg.db_path)
     poller = Poller(cfg, db)
+    # Cloud ingest runs only when its own credentials are configured. It is
+    # isolated from the poller: its failures surface in /api/v1/status and
+    # never stop local collection or the read API.
+    cloud_syncer = CloudSyncer(cfg, db) if cfg.cloud_configured else None
     from .api import make_server
 
     server = make_server(cfg, db, poller)
 
     def stop(signum, _frame):
+        if cloud_syncer is not None:
+            cloud_syncer.stop()
         poller.stop()
         server.shutdown()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     poller.start()
+    if cloud_syncer is not None:
+        cloud_syncer.start()
     try:
         server.serve_forever()
     finally:
+        if cloud_syncer is not None:
+            cloud_syncer.stop()
         poller.stop()
         server.server_close()
         db.close()

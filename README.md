@@ -20,6 +20,8 @@ SQLite is in WAL mode with `synchronous=FULL`. One process holds `DATA_DIR/colle
 | `sensors` | The sensor id and `sensor_token` already recorded. Kept so `GET /api/v1/channels` can return `sensor_id`. The token is not served. New hourly records do not add rows |
 | `hourly_records` | One row per bridge hourly energy record: the record id, energy values in integer milli-kWh, the raw JSON, and the time the record was acknowledged |
 | `hourly_backfill_provenance` | Left untouched when it already exists. This process does not create or modify it |
+| `cloud_hourly_records` | Neurio cloud hourly stats, keyed by the hour's end. Created by cloud ingest on first use; absent until then |
+| `cloud_sync_state` | Cloud ingest progress: harvested range, last attempt/success/error. Created with `cloud_hourly_records` |
 
 Opening the database migrates it to schema 3. The migration drops `sample_channels`, `sample_cts`, `energy_spans`, `counter_epochs`, `samples`, `channels`, and `poll_attempts`, then runs `VACUUM` when it actually dropped tables or the schema version was not yet 3. It does not change rows in `hourly_records`, `hourly_backfill_provenance`, or `sensors`. Running it again is a no-op aside from rewriting `schema_version` to `3`.
 
@@ -33,7 +35,7 @@ Opening the database migrates it to schema 3. The migration drops `sample_channe
 
 `GET /api/v1/channels` still returns `{"channels": [...]}`. Each preserved `sensors` row is one object with `identity_key`, `type`, `ch`, `first_seen_utc`, `last_seen_utc`, `reading_notice`, `label`, and `sensor_id` (omitted only for the historical missing-id placeholder). `sensor_id` is the stored id. `sensor_token` is not included. `type`, `ch`, `identity_key`, and `label` are null because those columns lived on `channels`, which is dropped. rate-plan-tool reads this route when it does not already know the sensor id.
 
-`GET /api/v1/status` reports `device_fresh` from the last hourly message. A running process uses the subscriber's last hourly message time. After a restart, before this process has seen a message, it uses the newest `hourly_records.received_at_utc`. The threshold is `NEURIO_HOURLY_STALE_AFTER_SECONDS` (default 3900). Status counts hourly records only.
+`GET /api/v1/status` reports `device_fresh` from the last hourly message. A running process uses the subscriber's last hourly message time. After a restart, before this process has seen a message, it uses the newest `hourly_records.received_at_utc`. The threshold is `NEURIO_HOURLY_STALE_AFTER_SECONDS` (default 3900). Status counts hourly records only. It also carries a `cloud_ingest` section — configured, harvested range, last sync attempt/success/error, hours stored, newest cloud hour — which reports an empty, unconfigured state until cloud ingest is enabled and has run.
 
 `/api/v1/energy`, `/api/v1/samples`, `/api/v1/spans`, `/api/v1/latest`, and the CSV exports are gone.
 
@@ -82,6 +84,14 @@ PYTHONPATH=src python3 -m neurio_collector
 ```
 
 On a broker that requires a login, also set `MQTT_USERNAME` and `MQTT_PASSWORD_FILE`.
+
+## Cloud ingest
+
+Alongside the MQTT hourly records, the recorder can pull hourly energy history from the Neurio cloud, so the cloud and local records sit side by side in one database ahead of the cloud's eventual shutdown. Set `NEURIO_CLIENT_ID` and `NEURIO_CLIENT_SECRET` (or `NEURIO_CLIENT_SECRET_FILE`) to enable it; with neither set, nothing about the process changes. The connection is outbound-only and independent of the MQTT source.
+
+The syncer authenticates with the OAuth client-credentials grant, discovers the sensor id from `/v1/users/current` (or takes `NEURIO_CLOUD_SENSOR_ID`), and reads `GET /v1/samples/stats` at `granularity=hours`. Those values are per-hour interval watt-seconds: they are stored as-is (never differenced), converted to milli-kWh, and keyed by the hour's end in the dedicated `cloud_hourly_records` table — separate from the bridge's `hourly_records`, so a cloud value and an ESP32 value for the same hour both survive. Each row keeps the time it was first fetched, which doubles as the cloud-lateness measurement.
+
+Two jobs run on a `NEURIO_CLOUD_SYNC_INTERVAL_SECONDS` cadence (default 3600): a one-time **harvest** that backfills from `NEURIO_CLOUD_HARVEST_FROM` (default 2016-01-01Z) to now in 10-day chunks, persisting its progress after each chunk so a restart resumes instead of restarting; and a **tail sync** that re-fetches the trailing `NEURIO_CLOUD_TAIL_HOURS` (default 48) every cycle, so late or corrected cloud values replace the earlier ones in place. Cloud failures appear in the `cloud_ingest` section of `/api/v1/status` and nowhere else — they never affect the MQTT subscriber or the read API. `NEURIO_CLOUD_API_BASE` defaults to `https://api.neur.io/v1` and accepts plain http only for a loopback host, so a local test server can stand in for the cloud.
 
 ## Deploy with Docker Compose
 
