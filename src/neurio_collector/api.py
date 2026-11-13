@@ -260,10 +260,6 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
             "last_hourly_message_at_utc": snap.get("last_hourly_message_at"),
             "ack_topic": cfg.mqtt_ack_topic,
         },
-        "source_built": True,
-        "unit_tested_claim": "fixture tests are not live verification; this process does not re-run the suite",
-        "docker_image_built": False,
-        "deployed": False,
     }
 
 
