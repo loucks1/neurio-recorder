@@ -418,6 +418,27 @@ class HourlyIngestTests(unittest.TestCase):
         self.assertEqual(row["device_timestamp_raw"], "2026-11-06 17:00:00")
         self.assertIsNone(row["device_timestamp_utc"])
 
+    def test_ack_required_flag_is_stored_only_when_boolean(self):
+        db = support.open_db(self)
+        cfg = support.make_config()
+
+        def stored_flag(body):
+            result = store_hourly_record(db, body, RECEIVED, cfg)
+            self.assertEqual(result.outcome, "stored")
+            return db.conn.execute(
+                "SELECT ack_required FROM hourly_records WHERE record_id=?",
+                (result.record_id,),
+            ).fetchone()[0]
+
+        base = int(HOURLY_ID)
+        # Absent: NULL — behaviour exactly as before the field existed.
+        self.assertIsNone(stored_flag(hourly_body(id=base + 1)))
+        self.assertEqual(stored_flag(hourly_body(id=base + 2, ack_required=False)), 0)
+        self.assertEqual(stored_flag(hourly_body(id=base + 3, ack_required=True)), 1)
+        # A non-boolean is treated as absent, never a parse error.
+        self.assertIsNone(stored_flag(hourly_body(id=base + 4, ack_required="false")))
+        self.assertIsNone(stored_flag(hourly_body(id=base + 5, ack_required=0)))
+
 
 class FakeMqttClient:
     def __init__(self, messages):
@@ -531,6 +552,43 @@ class MqttPollerTests(unittest.TestCase):
         self.assertEqual(snap["last_ack_mark_error"], "RuntimeError")
         self.assertIsNotNone(snap["last_ack_mark_error_at"])
         self.assertEqual(snap["last_outcome"], "success")
+
+    def test_poller_still_acks_an_ack_not_required_record(self):
+        db = support.open_db(self)
+        cfg = support.make_config()
+        fake = FakeMqttClient(
+            [
+                MqttMessage(
+                    topic="neurio/hourly/energy",
+                    payload=hourly_body(ack_required=False),
+                    qos=1,
+                )
+            ]
+        )
+        poller = Poller(cfg, db, mqtt_client_factory=lambda: fake)
+        poller.start()
+        try:
+            wait_for(
+                self,
+                lambda: db.conn.execute(
+                    "SELECT acked_at_utc FROM hourly_records "
+                    "WHERE record_id=? AND acked_at_utc IS NOT NULL",
+                    (HOURLY_ID,),
+                ).fetchone()
+                is not None,
+            )
+        finally:
+            poller.stop()
+        # The ACK is published exactly as for any other record; the flag
+        # only changes how the status endpoint classifies the row.
+        self.assertEqual(
+            fake.published, [("neurio/hourly/ack", str(HOURLY_ID).encode())]
+        )
+        row = db.conn.execute(
+            "SELECT ack_required FROM hourly_records WHERE record_id=?",
+            (HOURLY_ID,),
+        ).fetchone()
+        self.assertEqual(row[0], 0)
 
     def test_poller_never_acks_a_bad_hourly_payload(self):
         db = support.open_db(self)

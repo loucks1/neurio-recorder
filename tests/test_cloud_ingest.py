@@ -25,7 +25,7 @@ from neurio_collector.cloud_ingest import (
 )
 from neurio_collector.cloud_sync import CloudSyncer, _backoff_seconds
 from neurio_collector.config import Config, ConfigError, Secret
-from neurio_collector.mqtt_ingest import store_hourly_record
+from neurio_collector.mqtt_ingest import mark_hourly_acked, store_hourly_record
 from neurio_collector.timeutil import format_utc, parse_instant
 
 UTC = timezone.utc
@@ -921,6 +921,61 @@ class StatusTests(unittest.TestCase):
         self.assertFalse(section["backing_off"])
         self.assertIsNone(section["backoff_until_utc"])
         self.assertIsNone(section["tail_window_start_utc"])
+
+    def test_status_ack_classification_splits_the_unacked(self):
+        db = support.open_db(self)
+        cfg = support.make_config(data_dir=db.path.rsplit("/", 1)[0])
+        db.conn.execute(
+            "CREATE TABLE hourly_backfill_provenance("
+            "record_id INTEGER PRIMARY KEY, backfill_source TEXT NOT NULL, "
+            "detail TEXT NOT NULL)"
+        )
+
+        def store(record_id, received, **changes):
+            body = {
+                "id": record_id,
+                "timestamp": "2026-11-11T10:00:00Z",
+                "net": {"delta_net_kwh": 1.0},
+            }
+            body.update(changes)
+            result = store_hourly_record(
+                db, json.dumps(body).encode(), received, cfg
+            )
+            self.assertEqual(result.outcome, "stored")
+
+        # (a) Backfill row: provenance entry, never ACKed, days old.
+        store(101, NOW - timedelta(days=3))
+        db.conn.execute(
+            "INSERT INTO hourly_backfill_provenance VALUES"
+            "(101, 'neurio_cloud_stats', 'backfill-20261110')"
+        )
+        # (c) Native, ACKed.
+        store(102, NOW - timedelta(hours=2))
+        mark_hourly_acked(db, 102, NOW - timedelta(hours=2))
+        # (b) Pending, fresh and old.
+        store(103, NOW - timedelta(minutes=5))
+        store(104, NOW - timedelta(hours=2))
+        # (a) Bridge says no ACK required; old, but not pending or stuck.
+        store(105, NOW - timedelta(hours=3), ack_required=False)
+        # (b) Explicitly required, and a non-boolean treated as absent.
+        store(106, NOW - timedelta(minutes=10), ack_required=True)
+        store(107, NOW - timedelta(minutes=10), ack_required="no")
+
+        hourly = build_status(cfg, db, None, NOW)["hourly_records"]
+        self.assertEqual(hourly["stored"], 7)
+        self.assertEqual(hourly["acked"], 1)
+        self.assertEqual(hourly["ack_not_required"], 2)
+        self.assertEqual(hourly["ack_pending"], 4)
+        self.assertEqual(hourly["ack_pending_stuck"], 1)
+        self.assertEqual(
+            hourly["ack_pending_oldest_received_at_utc"],
+            format_utc(NOW - timedelta(hours=2)),
+        )
+        # The three classes partition the table.
+        self.assertEqual(
+            hourly["acked"] + hourly["ack_not_required"] + hourly["ack_pending"],
+            hourly["stored"],
+        )
 
     def test_status_tail_window_start_reflects_the_watermark(self):
         db = support.open_db(self)

@@ -204,7 +204,11 @@ class MigrationTests(unittest.TestCase):
                 "kept_notes",
             ):
                 self.assertIn(kept, names)
-            self.assertEqual(_rows(db.conn, "SELECT * FROM hourly_records"), [hourly])
+            # The schema-4 migration adds ack_required; the row survives
+            # with NULL (the payload said nothing — ACK expected).
+            self.assertEqual(
+                _rows(db.conn, "SELECT * FROM hourly_records"), [hourly + (None,)]
+            )
             self.assertEqual(
                 _rows(db.conn, "SELECT * FROM hourly_backfill_provenance"), [provenance]
             )
@@ -219,7 +223,8 @@ class MigrationTests(unittest.TestCase):
                 )],
             )
             self.assertEqual(_rows(db.conn, "SELECT * FROM kept_notes"), [(1, "leave this")])
-            self.assertEqual(_sql(db.conn, "hourly_records"), hourly_sql)
+            self.assertIn("ack_required", _sql(db.conn, "hourly_records"))
+            self.assertNotEqual(_sql(db.conn, "hourly_records"), hourly_sql)
             self.assertEqual(_sql(db.conn, "hourly_backfill_provenance"), provenance_sql)
             self.assertEqual(_sql(db.conn, "sensors"), sensor_sql)
             self.assertEqual(_sql(db.conn, "kept_notes"), notes_sql)
@@ -233,7 +238,7 @@ class MigrationTests(unittest.TestCase):
                 db.conn.execute("SELECT value FROM meta WHERE key='note'").fetchone()["value"],
                 "keep-me",
             )
-            self.assertEqual(db.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.conn.execute("PRAGMA user_version").fetchone()[0], 4)
             after_pages = db.conn.execute("PRAGMA page_count").fetchone()[0]
             self.assertLess(after_pages, before_pages)
             cfg = support.make_config()
@@ -247,11 +252,13 @@ class MigrationTests(unittest.TestCase):
 
         again = Database(path)
         self.addCleanup(again.close)
-        self.assertEqual(_rows(again.conn, "SELECT * FROM hourly_records"), [hourly])
+        self.assertEqual(
+            _rows(again.conn, "SELECT * FROM hourly_records"), [hourly + (None,)]
+        )
         self.assertEqual(
             _rows(again.conn, "SELECT * FROM hourly_backfill_provenance"), [provenance]
         )
-        self.assertEqual(_sql(again.conn, "hourly_records"), hourly_sql)
+        self.assertIn("ack_required", _sql(again.conn, "hourly_records"))
         self.assertEqual(_sql(again.conn, "hourly_backfill_provenance"), provenance_sql)
         for raw in RAW_TABLES:
             self.assertNotIn(raw, _tables(again.conn))
@@ -259,7 +266,55 @@ class MigrationTests(unittest.TestCase):
             again.conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()["value"],
-            "3",
+            "4",
+        )
+
+    def test_schema3_database_gains_ack_required(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "neurio.sqlite")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('schema_version', '3')"
+        )
+        conn.execute(
+            "CREATE TABLE hourly_records ("
+            "record_id INTEGER PRIMARY KEY, device_timestamp_raw TEXT, "
+            "device_timestamp_utc TEXT, retries INTEGER NOT NULL DEFAULT 0, "
+            "received_at_utc TEXT NOT NULL, raw_json TEXT NOT NULL, "
+            "net_import_millikwh INTEGER, net_export_millikwh INTEGER, "
+            "net_delta_net_millikwh INTEGER, "
+            "generation_delta_export_millikwh INTEGER, "
+            "consumption_delta_import_millikwh INTEGER, "
+            "phase_a_delta_import_millikwh INTEGER, "
+            "phase_b_delta_import_millikwh INTEGER, acked_at_utc TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO hourly_records(record_id, received_at_utc, raw_json) "
+            "VALUES(7, '2026-11-06T18:00:05.000Z', '{\"id\":7}')"
+        )
+        conn.execute("PRAGMA user_version=3")
+        conn.commit()
+        conn.close()
+
+        db = Database(path)
+        self.addCleanup(db.close)
+        columns = {
+            row[1] for row in db.conn.execute("PRAGMA table_info(hourly_records)")
+        }
+        self.assertIn("ack_required", columns)
+        row = db.conn.execute(
+            "SELECT ack_required FROM hourly_records WHERE record_id=7"
+        ).fetchone()
+        self.assertIsNone(row[0])
+        self.assertEqual(
+            db.conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()["value"],
+            "4",
         )
 
     def test_fresh_database_has_no_raw_tables(self):
@@ -268,9 +323,13 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(names, {"meta", "sensors", "hourly_records"})
         self.assertEqual(
             db.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"],
-            "3",
+            "4",
         )
-        self.assertEqual(db.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(db.conn.execute("PRAGMA user_version").fetchone()[0], 4)
+        columns = {
+            row[1] for row in db.conn.execute("PRAGMA table_info(hourly_records)")
+        }
+        self.assertIn("ack_required", columns)
 
 
 if __name__ == "__main__":
