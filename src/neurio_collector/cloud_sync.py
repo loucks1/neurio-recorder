@@ -10,7 +10,12 @@ never stall the poller or the read API.
   instead of starting over.
 - Tail sync: every cycle, the trailing ``cloud_tail_hours`` are
   re-fetched and upserted, so late or corrected cloud values replace the
-  provisional ones in place.
+  provisional ones in place. The window starts at the earlier of the
+  trailing window and the last fully successful sync
+  (``last_success_at_utc``, persisted in the state row), so downtime
+  longer than the window is back-filled on the next successful pass
+  instead of being skipped permanently. The watermark advances only
+  when a whole cycle — harvest and tail — succeeds.
 
 Windows are chunked at 10 days (240 hourly items per response, well under
 the API's paging sizes) and both API window bounds are inclusive, so
@@ -110,7 +115,7 @@ class CloudSyncer:
             if not state["harvest_complete"]:
                 if not self._harvest(sensor_id, state, now):
                     return
-            if not self._tail(sensor_id, now):
+            if not self._tail(sensor_id, state, now):
                 return
         except Exception as exc:
             update_sync_state(
@@ -179,8 +184,14 @@ class CloudSyncer:
         update_sync_state(self.db, harvest_complete=1)
         return True
 
-    def _tail(self, sensor_id: str, now: datetime) -> bool:
+    def _tail(self, sensor_id: str, state: dict, now: datetime) -> bool:
         start = now - timedelta(hours=self.cfg.cloud_tail_hours)
+        anchor = _parse_or_none(state.get("last_success_at_utc"))
+        if anchor is not None and anchor < start:
+            # The last fully successful pass predates the trailing
+            # window: everything since it is re-fetched, so an outage
+            # longer than the window leaves no permanent gap.
+            start = anchor
         while start < now:
             if self._stop.is_set():
                 return False
@@ -301,6 +312,15 @@ class CloudSyncer:
         if seconds <= 0:
             return False
         return bool(self._sleeper(seconds))
+
+
+def _parse_or_none(text) -> datetime | None:
+    if not text:
+        return None
+    try:
+        return parse_instant(text)
+    except ValueError:
+        return None
 
 
 def _backoff_seconds(retry_after_ms: int | None) -> float:

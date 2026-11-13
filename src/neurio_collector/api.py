@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -23,7 +23,7 @@ from .hourly_merge import (
     pct_difference,
     provenance_by_record,
 )
-from .timeutil import parse_instant, utcnow
+from .timeutil import format_utc, parse_instant, utcnow
 from .units import ws_to_kwh_str
 
 MAX_LIMIT = 1000
@@ -125,6 +125,7 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
         "min_request_interval_seconds": cfg.cloud_request_interval_seconds,
         "backing_off": False,
         "backoff_until_utc": None,
+        "tail_window_start_utc": None,
     }
     merge = _empty_merge()
     try:
@@ -215,6 +216,21 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
     # db_ok or /readyz: the recorder's own hourly store is fine.
     if db_ok:
         merge = _load_merge(db)
+    if cfg.cloud_configured:
+        # Where the next tail sync will start: the trailing window, or
+        # the last fully successful sync when that is older — the same
+        # computation as cloud_sync's tail, so a stuck or back-filling
+        # sync is visible here (and in rate-plan-tool's System tab).
+        tail_start = now - timedelta(hours=cfg.cloud_tail_hours)
+        last_success = cloud["last_success_at_utc"]
+        if last_success:
+            try:
+                anchor = parse_instant(last_success)
+            except ValueError:
+                anchor = None
+            if anchor is not None and anchor < tail_start:
+                tail_start = anchor
+        cloud["tail_window_start_utc"] = format_utc(tail_start)
     fresh, age = _hourly_fresh(
         cfg,
         db if db_ok else None,
