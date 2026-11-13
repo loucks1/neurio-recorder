@@ -76,6 +76,7 @@ class CloudSyncer:
         self._thread: threading.Thread | None = None
         self._last_cloud_request_at: datetime | None = None
         self._backoff_until = _UNSET
+        self.state_write_failures = 0
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -93,10 +94,44 @@ class CloudSyncer:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            self.run_cycle()
+            try:
+                self.run_cycle()
+            except Exception as exc:
+                # run_cycle is written never to raise; this guard keeps
+                # the sync thread alive even if that invariant is ever
+                # broken, instead of sync ending silently until restart.
+                self._update_state(
+                    last_error=public_cloud_error(exc),
+                    last_error_at_utc=format_utc(self.clock()),
+                )
             if self._stop.is_set():
                 return
             self._stop.wait(self.cfg.cloud_sync_interval_seconds)
+
+    def _update_state(self, **fields) -> None:
+        """Write sync state without ever raising.
+
+        A failed state write (a locked or briefly unavailable database)
+        must not kill the sync thread or mask the cycle's real outcome:
+        the failure is counted on the syncer, and — unless the failed
+        write was itself setting an error — one best-effort attempt is
+        made to surface it as last_error, where /api/v1/status shows
+        it. If that attempt also fails, the count remains as the
+        in-process trace and the next cycle's writes proceed as usual.
+        """
+        try:
+            update_sync_state(self.db, **fields)
+        except Exception as exc:
+            self.state_write_failures += 1
+            if not fields.get("last_error"):
+                try:
+                    update_sync_state(
+                        self.db,
+                        last_error=f"state_write_failed: {type(exc).__name__}",
+                        last_error_at_utc=format_utc(self.clock()),
+                    )
+                except Exception:
+                    pass
 
     def run_cycle(self) -> None:
         """One harvest step (until complete) plus one tail sync.
@@ -106,8 +141,8 @@ class CloudSyncer:
         recording a failure.
         """
         now = self.clock()
-        update_sync_state(self.db, last_attempt_at_utc=format_utc(now))
         try:
+            self._update_state(last_attempt_at_utc=format_utc(now))
             state = read_sync_state(self.db)
             sensor_id = self._sensor_id(state)
             if sensor_id is None:
@@ -118,14 +153,12 @@ class CloudSyncer:
             if not self._tail(sensor_id, state, now):
                 return
         except Exception as exc:
-            update_sync_state(
-                self.db,
+            self._update_state(
                 last_error=public_cloud_error(exc),
                 last_error_at_utc=format_utc(self.clock()),
             )
             return
-        update_sync_state(
-            self.db,
+        self._update_state(
             last_success_at_utc=format_utc(self.clock()),
             last_error=None,
             backoff_until_utc=None,
@@ -140,7 +173,7 @@ class CloudSyncer:
         sensor_id = self._call(self.client.get_sensor_id)
         if sensor_id is None:
             return None
-        update_sync_state(self.db, sensor_id=sensor_id)
+        self._update_state(sensor_id=sensor_id)
         return sensor_id
 
     def _harvest_floor(self, state: dict) -> datetime:
@@ -150,7 +183,7 @@ class CloudSyncer:
             floor = parse_instant(self.cfg.cloud_harvest_from)
         else:
             floor = DEFAULT_HARVEST_FLOOR
-        update_sync_state(self.db, harvest_from_utc=format_utc(floor))
+        self._update_state(harvest_from_utc=format_utc(floor))
         return floor
 
     def _harvest(self, sensor_id: str, state: dict, now: datetime) -> bool:
@@ -180,8 +213,8 @@ class CloudSyncer:
             # Persist after the chunk's rows commit: a crash between chunks
             # resumes at this boundary, and the upsert makes the shared
             # boundary hour harmless.
-            update_sync_state(self.db, harvest_through_utc=format_utc(start))
-        update_sync_state(self.db, harvest_complete=1)
+            self._update_state(harvest_through_utc=format_utc(start))
+        self._update_state(harvest_complete=1)
         return True
 
     def _tail(self, sensor_id: str, state: dict, now: datetime) -> bool:
@@ -266,8 +299,7 @@ class CloudSyncer:
         until = self.clock() + timedelta(seconds=wait)
         stamp = format_utc(until)
         self._backoff_until = stamp
-        update_sync_state(
-            self.db,
+        self._update_state(
             backoff_until_utc=stamp,
             last_error="CloudError: rate_limit_exceeding",
             last_error_at_utc=format_utc(self.clock()),
@@ -278,7 +310,7 @@ class CloudSyncer:
         # The window has reset. Resume this chunk now; the following
         # chunks go back to the steady gap.
         self._last_cloud_request_at = None
-        update_sync_state(self.db, backoff_until_utc=None, last_error=None)
+        self._update_state(backoff_until_utc=None, last_error=None)
         return not self._stop.is_set()
 
     def _wait_out_backoff(self) -> bool:
@@ -296,13 +328,13 @@ class CloudSyncer:
         if remaining <= 0:
             self._backoff_until = None
             self._last_cloud_request_at = None
-            update_sync_state(self.db, backoff_until_utc=None)
+            self._update_state(backoff_until_utc=None)
             return not self._stop.is_set()
         if self._wait(remaining):
             return False
         self._backoff_until = None
         self._last_cloud_request_at = None
-        update_sync_state(self.db, backoff_until_utc=None, last_error=None)
+        self._update_state(backoff_until_utc=None, last_error=None)
         return not self._stop.is_set()
 
     def _wait(self, seconds: float) -> bool:

@@ -68,6 +68,9 @@ class Poller:
             "storage_error": None,
             "mqtt_hourly_messages": 0,
             "last_hourly_message_at": None,
+            "ack_mark_failures": 0,
+            "last_ack_mark_error": None,
+            "last_ack_mark_error_at": None,
         }
 
     def start(self) -> None:
@@ -165,9 +168,26 @@ class Poller:
         # The record is durable, stored by this delivery or an earlier one.
         # Only now is it safe to acknowledge it.
         client.publish(self.cfg.mqtt_ack_topic, str(result.record_id).encode("ascii"))
-        mark_hourly_acked(self.db, result.record_id, self.clock())
+        try:
+            mark_hourly_acked(self.db, result.record_id, self.clock())
+        except Exception as exc:
+            # The ACK is already published and the bridge has dropped the
+            # record from its queue. A bookkeeping failure here must not
+            # tear down the connection (that looped reconnects and left
+            # the record unmarked forever) and must not pass silently:
+            # it is counted in the poller state, where /api/v1/status
+            # exposes it, and the record stays stored with
+            # acked_at_utc NULL — visible in the hourly counts as
+            # stored-but-unacked.
+            self._note_ack_mark_failure(exc)
         outcome = "success" if result.outcome == "stored" else "duplicate"
         self._success(started, self.clock(), outcome)
+
+    def _note_ack_mark_failure(self, exc) -> None:
+        with self._state_lock:
+            self.state["ack_mark_failures"] += 1
+            self.state["last_ack_mark_error"] = type(exc).__name__
+            self.state["last_ack_mark_error_at"] = format_utc(self.clock())
 
     def _success(self, started, finished, outcome) -> None:
         self._failures = 0

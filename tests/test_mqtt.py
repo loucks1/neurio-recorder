@@ -3,9 +3,11 @@
 import json
 import time
 import unittest
+import unittest.mock
 from datetime import timedelta
 
 import support
+import neurio_collector.poller as poller_module
 from neurio_collector.api import dispatch
 from neurio_collector.config import Config, ConfigError
 from neurio_collector.mqtt_client import MqttClient, MqttError, MqttMessage
@@ -487,6 +489,48 @@ class MqttPollerTests(unittest.TestCase):
         }
         self.assertNotIn("poll_attempts", names)
         self.assertNotIn("samples", names)
+
+    def test_ack_mark_failure_keeps_connection_and_is_visible(self):
+        db = support.open_db(self)
+        cfg = support.make_config()
+        fake = FakeMqttClient(
+            [MqttMessage(topic="neurio/hourly/energy", payload=hourly_body(), qos=1)]
+        )
+        factory_calls = []
+
+        def factory():
+            factory_calls.append(1)
+            return fake
+
+        def broken_mark(db_, record_id, when):
+            raise RuntimeError("database is locked")
+
+        poller = Poller(cfg, db, mqtt_client_factory=factory)
+        with unittest.mock.patch.object(
+            poller_module, "mark_hourly_acked", broken_mark
+        ):
+            poller.start()
+            try:
+                wait_for(self, lambda: poller.snapshot()["ack_mark_failures"] == 1)
+            finally:
+                poller.stop()
+        # The ACK was still published — the bridge dropped the record.
+        self.assertEqual(
+            fake.published, [("neurio/hourly/ack", str(HOURLY_ID).encode())]
+        )
+        # No reconnect loop: the factory ran once for the whole session.
+        self.assertEqual(len(factory_calls), 1)
+        # The record is intact, stored but unmarked.
+        row = db.conn.execute(
+            "SELECT acked_at_utc FROM hourly_records WHERE record_id=?",
+            (HOURLY_ID,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["acked_at_utc"])
+        snap = poller.snapshot()
+        self.assertEqual(snap["last_ack_mark_error"], "RuntimeError")
+        self.assertIsNotNone(snap["last_ack_mark_error_at"])
+        self.assertEqual(snap["last_outcome"], "success")
 
     def test_poller_never_acks_a_bad_hourly_payload(self):
         db = support.open_db(self)
