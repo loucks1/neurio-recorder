@@ -161,7 +161,10 @@ def store_cloud_hours(db: Database, items: list, fetched_at: datetime) -> tuple[
     Re-fetching an hour replaces its values (late cloud corrections land),
     and ``last_fetched_at_utc`` advances, but ``fetched_at_utc`` keeps the
     first time this recorder saw the hour — that first-fetch time is the
-    cloud-lateness measurement.
+    cloud-lateness measurement. Replacement is per quantity: an incoming
+    NULL (a partial stats response that omitted the field) never erases a
+    stored non-NULL value, while a real value — including a genuine
+    zero — always replaces.
     """
     hours = []
     skipped = 0
@@ -184,10 +187,14 @@ def store_cloud_hours(db: Database, items: list, fetched_at: datetime) -> tuple[
                     "ON CONFLICT(hour_end_epoch) DO UPDATE SET "
                     "hour_start_utc=excluded.hour_start_utc, "
                     "hour_end_utc=excluded.hour_end_utc, "
-                    "consumption_millikwh=excluded.consumption_millikwh, "
-                    "generation_millikwh=excluded.generation_millikwh, "
-                    "imported_millikwh=excluded.imported_millikwh, "
-                    "exported_millikwh=excluded.exported_millikwh, "
+                    "consumption_millikwh=COALESCE(excluded.consumption_millikwh, "
+                    "cloud_hourly_records.consumption_millikwh), "
+                    "generation_millikwh=COALESCE(excluded.generation_millikwh, "
+                    "cloud_hourly_records.generation_millikwh), "
+                    "imported_millikwh=COALESCE(excluded.imported_millikwh, "
+                    "cloud_hourly_records.imported_millikwh), "
+                    "exported_millikwh=COALESCE(excluded.exported_millikwh, "
+                    "cloud_hourly_records.exported_millikwh), "
                     "last_fetched_at_utc=excluded.last_fetched_at_utc",
                     (
                         hour.hour_end_epoch,

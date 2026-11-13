@@ -7,11 +7,13 @@ chosen so the expected milli-kWh results are known exactly.
 import json
 import threading
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import support
+import neurio_collector.cloud_sync as cloud_sync_module
 from neurio_collector.api import build_status, dispatch
 from neurio_collector.cloud_client import CloudError, NeurioCloudClient
 from neurio_collector.cloud_ingest import (
@@ -485,6 +487,58 @@ class SyncTests(unittest.TestCase):
         state = read_sync_state(db)
         self.assertEqual(state["last_success_at_utc"], format_utc(NOW))
 
+    def test_failed_success_write_is_recorded_and_sync_continues(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db)
+        self._seed_tail_state(db, last_success=NOW - timedelta(hours=1))
+        cloud = FakeCloud({})
+        syncer = self._syncer(db, cfg, cloud, [NOW])
+        real_update = cloud_sync_module.update_sync_state
+
+        def flaky(db_, **fields):
+            if "last_success_at_utc" in fields:
+                raise RuntimeError("database is locked")
+            return real_update(db_, **fields)
+
+        with unittest.mock.patch.object(
+            cloud_sync_module, "update_sync_state", flaky
+        ):
+            syncer.run_cycle()  # must not raise
+        self.assertGreaterEqual(syncer.state_write_failures, 1)
+        state = read_sync_state(db)
+        self.assertIn("state_write_failed", state["last_error"])
+        # The success stamp never landed, so it stays at the seeded value.
+        self.assertEqual(
+            state["last_success_at_utc"], format_utc(NOW - timedelta(hours=1))
+        )
+        # The next cycle is unaffected: sync is alive, not dead until restart.
+        syncer.run_cycle()
+        state = read_sync_state(db)
+        self.assertEqual(state["last_success_at_utc"], format_utc(NOW))
+        self.assertIsNone(state["last_error"])
+
+    def test_failed_attempt_write_does_not_abort_the_cycle(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db)
+        self._seed_tail_state(db, last_success=NOW - timedelta(hours=1))
+        cloud = FakeCloud({})
+        syncer = self._syncer(db, cfg, cloud, [NOW])
+        real_update = cloud_sync_module.update_sync_state
+
+        def flaky(db_, **fields):
+            if "last_attempt_at_utc" in fields:
+                raise RuntimeError("database is locked")
+            return real_update(db_, **fields)
+
+        with unittest.mock.patch.object(
+            cloud_sync_module, "update_sync_state", flaky
+        ):
+            syncer.run_cycle()  # must not raise
+        self.assertEqual(syncer.state_write_failures, 1)
+        state = read_sync_state(db)
+        self.assertEqual(state["last_success_at_utc"], format_utc(NOW))
+        self.assertIsNone(state["last_error"])
+
     def _syncer(self, db, cfg, cloud, clock_holder, sleeper=None):
         client = NeurioCloudClient(cfg, transport=cloud)
         return CloudSyncer(
@@ -647,6 +701,37 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(row["hour_end_epoch"], expected_end)
         self.assertEqual(row["hour_end_utc"], "2026-03-08T08:00:00.000Z")
 
+    def test_partial_refetch_never_nulls_stored_quantities(self):
+        db = support.open_db(self)
+        full = {
+            "start": "2026-11-11T10:00:00Z",
+            "end": "2026-11-11T11:00:00Z",
+            "consumptionEnergy": 3_600_000,
+            "generationEnergy": 1_800_000,
+            "importedEnergy": 3_600_000,
+            "exportedEnergy": 1_800_000,
+        }
+        store_cloud_hours(db, [full], NOW)
+        # A later partial response for the same hour: generation and
+        # exported are omitted (they parse to NULL) and consumption is
+        # corrected. The NULLs must not erase the stored values.
+        partial = {
+            "start": "2026-11-11T10:00:00Z",
+            "end": "2026-11-11T11:00:00Z",
+            "consumptionEnergy": 7_200_000,
+            "importedEnergy": 7_200_000,
+        }
+        store_cloud_hours(db, [partial], NOW)
+        row = db.conn.execute("SELECT * FROM cloud_hourly_records").fetchone()
+        self.assertEqual(row["consumption_millikwh"], 2000)
+        self.assertEqual(row["generation_millikwh"], 500)
+        self.assertEqual(row["imported_millikwh"], 2000)
+        self.assertEqual(row["exported_millikwh"], 500)
+        # A genuine zero is a real value and still replaces.
+        zeroed = {**full, "generationEnergy": 0}
+        store_cloud_hours(db, [zeroed], NOW)
+        row = db.conn.execute("SELECT * FROM cloud_hourly_records").fetchone()
+        self.assertEqual(row["generation_millikwh"], 0)
 
     def test_harvest_paces_between_chunks(self):
         db = support.open_db(self)
