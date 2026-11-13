@@ -22,6 +22,7 @@ remainder is below the ESP32's own 3-decimal kWh precision).
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -55,7 +56,8 @@ CREATE TABLE IF NOT EXISTS cloud_sync_state (
   last_success_at_utc TEXT,
   last_error TEXT,
   last_error_at_utc TEXT,
-  backoff_until_utc TEXT
+  backoff_until_utc TEXT,
+  unaligned_skipped_total INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -74,6 +76,11 @@ def ensure_cloud_tables(db: Database) -> None:
             db.conn.execute(
                 "ALTER TABLE cloud_sync_state ADD COLUMN backoff_until_utc TEXT"
             )
+        if "unaligned_skipped_total" not in have:
+            db.conn.execute(
+                "ALTER TABLE cloud_sync_state ADD COLUMN "
+                "unaligned_skipped_total INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 _STATE_COLUMNS = {
@@ -86,6 +93,7 @@ _STATE_COLUMNS = {
     "last_error",
     "last_error_at_utc",
     "backoff_until_utc",
+    "unaligned_skipped_total",
 }
 
 
@@ -165,19 +173,40 @@ def store_cloud_hours(db: Database, items: list, fetched_at: datetime) -> tuple[
     NULL (a partial stats response that omitted the field) never erases a
     stored non-NULL value, while a real value — including a genuine
     zero — always replaces.
+
+    Defense in depth: a bucket whose end is not hour-aligned is never
+    stored. The syncer requests only aligned windows, but if the API
+    ever buckets differently again, an off-hour row would overlap the
+    real on-the-hour records and be priced as an extra hour. Skips are
+    counted in the return value and accumulated in
+    cloud_sync_state.unaligned_skipped_total (surfaced by
+    /api/v1/status), and noted on stderr.
     """
     hours = []
     skipped = 0
+    unaligned = 0
     for item in items:
         hour = parse_stats_item(item)
         if hour is None:
             skipped += 1
+        elif hour.hour_end_epoch % 3600 != 0:
+            skipped += 1
+            unaligned += 1
         else:
             hours.append(hour)
     stamp = format_utc(fetched_at)
     ensure_cloud_tables(db)
     with db.write_lock:
         with db.transaction():
+            if unaligned:
+                db.conn.execute(
+                    "INSERT OR IGNORE INTO cloud_sync_state(id) VALUES(1)"
+                )
+                db.conn.execute(
+                    "UPDATE cloud_sync_state SET unaligned_skipped_total = "
+                    "unaligned_skipped_total + ? WHERE id=1",
+                    (unaligned,),
+                )
             for hour in hours:
                 db.conn.execute(
                     "INSERT INTO cloud_hourly_records(hour_end_epoch, hour_start_utc, "
@@ -208,6 +237,12 @@ def store_cloud_hours(db: Database, items: list, fetched_at: datetime) -> tuple[
                         stamp,
                     ),
                 )
+    if unaligned:
+        print(
+            f"neurio cloud ingest: skipped {unaligned} stats bucket(s) "
+            "whose end is not hour-aligned",
+            file=sys.stderr,
+        )
     return len(hours), skipped
 
 
