@@ -130,6 +130,7 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
         "backing_off": False,
         "backoff_until_utc": None,
         "tail_window_start_utc": None,
+        "unaligned_skipped_total": None,
     }
     merge = _empty_merge()
     try:
@@ -234,6 +235,7 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
                     "last_error",
                     "last_error_at_utc",
                     "backoff_until_utc",
+                    "unaligned_skipped_total",
                 )
                 selected = [name for name in wanted if name in state_columns]
                 state_row = None
@@ -252,6 +254,7 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
                         "last_error",
                         "last_error_at_utc",
                         "backoff_until_utc",
+                        "unaligned_skipped_total",
                     ):
                         if name in selected:
                             cloud[name] = state_row[name]

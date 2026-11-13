@@ -487,6 +487,53 @@ class SyncTests(unittest.TestCase):
         state = read_sync_state(db)
         self.assertEqual(state["last_success_at_utc"], format_utc(NOW))
 
+    def test_tail_requests_are_hour_aligned(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db)
+        now37 = datetime(2026, 11, 11, 12, 37, 24, tzinfo=UTC)
+        self._seed_tail_state(db, last_success=now37 - timedelta(hours=1))
+        cloud = FakeCloud({})
+        self._syncer(db, cfg, cloud, [now37]).run_cycle()
+        self.assertTrue(cloud.stats_windows)
+        for start_epoch, end_epoch in cloud.stats_windows:
+            self.assertEqual(start_epoch % 3600, 0)
+            self.assertEqual(end_epoch % 3600, 0)
+            self.assertLessEqual(end_epoch, int(now37.timestamp()) - 37 * 60 - 24)
+        # The window closes at the floored now — the in-progress hour
+        # (12:00-13:00, partial) is never requested.
+        self.assertEqual(
+            cloud.stats_windows[-1][1],
+            int(parse_instant("2026-11-11T12:00:00Z").timestamp()),
+        )
+        self.assertEqual(
+            cloud.stats_windows[0][0],
+            int(parse_instant("2026-11-09T12:00:00Z").timestamp()),
+        )
+
+    def test_harvest_resume_floors_an_unaligned_watermark(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db)
+        # A state row as the buggy build left it: mid-hour watermark.
+        update_sync_state(
+            db,
+            harvest_from_utc="2026-10-17T00:00:00.000Z",
+            harvest_through_utc="2026-10-20T05:37:00.000Z",
+        )
+        cloud = FakeCloud({})
+        self._syncer(db, cfg, cloud, [NOW]).run_cycle()
+        self.assertEqual(
+            cloud.stats_windows[0][0],
+            int(parse_instant("2026-10-20T05:00:00Z").timestamp()),
+        )
+        for start_epoch, end_epoch in cloud.stats_windows:
+            self.assertEqual(start_epoch % 3600, 0)
+            self.assertEqual(end_epoch % 3600, 0)
+        state = read_sync_state(db)
+        self.assertEqual(state["harvest_complete"], 1)
+        self.assertEqual(
+            int(parse_instant(state["harvest_through_utc"]).timestamp()) % 3600, 0
+        )
+
     def test_failed_success_write_is_recorded_and_sync_continues(self):
         db = support.open_db(self)
         cfg = cloud_config(db)
@@ -700,6 +747,37 @@ class SyncTests(unittest.TestCase):
         expected_end = int(parse_instant("2026-03-08T03:00:00-05:00").timestamp())
         self.assertEqual(row["hour_end_epoch"], expected_end)
         self.assertEqual(row["hour_end_utc"], "2026-03-08T08:00:00.000Z")
+
+    def test_unaligned_buckets_are_skipped_counted_and_surfaced(self):
+        db = support.open_db(self)
+        aligned = {
+            "start": "2026-11-11T10:00:00Z",
+            "end": "2026-11-11T11:00:00Z",
+            "consumptionEnergy": 3_600_000,
+        }
+        unaligned = {
+            "start": "2026-11-11T10:05:00Z",
+            "end": "2026-11-11T11:05:00Z",
+            "consumptionEnergy": 3_600_000,
+        }
+        stored, skipped = store_cloud_hours(db, [aligned, unaligned], NOW)
+        self.assertEqual((stored, skipped), (1, 1))
+        epochs = [
+            row[0]
+            for row in db.conn.execute(
+                "SELECT hour_end_epoch FROM cloud_hourly_records"
+            )
+        ]
+        self.assertEqual(
+            epochs, [int(parse_instant("2026-11-11T11:00:00Z").timestamp())]
+        )
+        self.assertEqual(read_sync_state(db)["unaligned_skipped_total"], 1)
+        # The counter accumulates across calls and reaches the status API.
+        store_cloud_hours(db, [unaligned], NOW)
+        self.assertEqual(read_sync_state(db)["unaligned_skipped_total"], 2)
+        cfg = cloud_config(db)
+        section = build_status(cfg, db, None, NOW)["cloud_ingest"]
+        self.assertEqual(section["unaligned_skipped_total"], 2)
 
     def test_partial_refetch_never_nulls_stored_quantities(self):
         db = support.open_db(self)

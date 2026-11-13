@@ -41,7 +41,7 @@ from .config import CLOUD_RATE_WINDOW_SECONDS, Config
 from .db import Database
 from .timeutil import format_utc, parse_instant, utcnow
 
-CHUNK = timedelta(days=10)
+CHUNK = timedelta(days=10)  # 240 hours exactly; see _floor_hour.
 DEFAULT_HARVEST_FLOOR = datetime(2016, 1, 1, tzinfo=timezone.utc)
 # A reset hint far past the published one-hour window is not trusted.
 _MAX_BACKOFF_SECONDS = CLOUD_RATE_WINDOW_SECONDS + 120
@@ -187,20 +187,25 @@ class CloudSyncer:
         return floor
 
     def _harvest(self, sensor_id: str, state: dict, now: datetime) -> bool:
-        floor = self._harvest_floor(state)
+        # Windows are snapped to whole hours (see _floor_hour): the
+        # persisted resume point is floored on use, so a database
+        # written by an unaligned build self-heals on the first cycle.
+        end_limit = _floor_hour(now)
+        floor = _floor_hour(self._harvest_floor(state))
         if state.get("harvest_through_utc"):
             start = parse_instant(state["harvest_through_utc"])
             if start < floor:
                 start = floor
         else:
             start = floor
-        while start < now:
+        start = _floor_hour(start)
+        while start < end_limit:
             # Checked before the request and before the pace sleep, so a
             # shutdown during a multi-year harvest returns on the chunk
             # boundary instead of after the remaining years.
             if self._stop.is_set():
                 return False
-            end = min(start + CHUNK, now)
+            end = min(start + CHUNK, end_limit)
             items = self._call(
                 lambda start=start, end=end: self.client.get_hourly_stats(
                     sensor_id, start, end
@@ -218,17 +223,23 @@ class CloudSyncer:
         return True
 
     def _tail(self, sensor_id: str, state: dict, now: datetime) -> bool:
-        start = now - timedelta(hours=self.cfg.cloud_tail_hours)
+        end_limit = _floor_hour(now)
+        start = _floor_hour(now - timedelta(hours=self.cfg.cloud_tail_hours))
         anchor = _parse_or_none(state.get("last_success_at_utc"))
-        if anchor is not None and anchor < start:
-            # The last fully successful pass predates the trailing
-            # window: everything since it is re-fetched, so an outage
-            # longer than the window leaves no permanent gap.
-            start = anchor
-        while start < now:
+        if anchor is not None:
+            # Floored on use, like the harvest watermark: an anchor
+            # persisted by an unaligned build must not perpetuate its
+            # minute offset into every later cycle.
+            anchor = _floor_hour(anchor)
+            if anchor < start:
+                # The last fully successful pass predates the trailing
+                # window: everything since it is re-fetched, so an outage
+                # longer than the window leaves no permanent gap.
+                start = anchor
+        while start < end_limit:
             if self._stop.is_set():
                 return False
-            end = min(start + CHUNK, now)
+            end = min(start + CHUNK, end_limit)
             items = self._call(
                 lambda start=start, end=end: self.client.get_hourly_stats(
                     sensor_id, start, end
@@ -353,6 +364,23 @@ def _parse_or_none(text) -> datetime | None:
         return parse_instant(text)
     except ValueError:
         return None
+
+
+def _floor_hour(moment: datetime) -> datetime:
+    """Snap a moment down to the whole hour.
+
+    The Neurio stats API buckets from the requested window start, so an
+    unaligned window (now minus 48h at minute :37, an anchor persisted
+    mid-hour) returns buckets ending at :05/:15 past the hour, which
+    store as separate rows overlapping the real on-the-hour records —
+    production gained 119 such rows and rate-plan-tool priced them as
+    extra hours. Every stats window therefore starts and ends on the
+    hour, and the in-progress hour is never requested: its bucket
+    would be partial. CHUNK is 10 days = 240 hours, an exact hour
+    multiple, so chunk stepping from a floored start stays aligned;
+    keep it that way.
+    """
+    return moment.replace(minute=0, second=0, microsecond=0)
 
 
 def _backoff_seconds(retry_after_ms: int | None) -> float:
