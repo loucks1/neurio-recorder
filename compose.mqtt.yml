@@ -10,6 +10,12 @@
 #   MQTT_USERNAME            required; no default
 #   MQTT_PASSWORD_HOST_FILE  default /srv/neurio-recorder/mqtt_password
 #   NEURIO_HOURLY_STALE_AFTER_SECONDS  default 3900
+#   NEURIO_CLIENT_ID / NEURIO_CLIENT_SECRET  optional; both set enables
+#                           Neurio cloud ingest (harvest + tail sync)
+#   NEURIO_CLOUD_SENSOR_ID  optional; skips sensor discovery
+#   NEURIO_CLOUD_SYNC_INTERVAL_SECONDS / NEURIO_CLOUD_TAIL_HOURS /
+#   NEURIO_CLOUD_HARVEST_FROM / NEURIO_CLOUD_MAX_REQUESTS_PER_HOUR
+#                           optional cloud knobs (defaults in .env.example)
 #
 # The broker password is the Compose file secret mqtt_password. It is not a
 # value in this file or in .env. The host file is mounted read-only at
@@ -57,6 +63,21 @@ services:
       NEURIO_POLL_INTERVAL_SECONDS: "15"
       NEURIO_POLL_TIMEOUT_SECONDS: "3"
       NEURIO_POLL_MAX_BACKOFF_SECONDS: "300"
+      # Cloud ingest (dual-source): the recorder pulls hourly history
+      # from the Neurio cloud into cloud_hourly_records. Disabled unless
+      # NEURIO_CLIENT_ID and NEURIO_CLIENT_SECRET are both set in .env.
+      # (The process also accepts NEURIO_CLIENT_SECRET_FILE, but this
+      # file does not pass it: the config rejects the pair when both
+      # secret variables are present-but-empty, which is exactly what
+      # an unset passthrough renders as. Use a Compose override to add
+      # the file variant, with the file mounted into the container.)
+      NEURIO_CLIENT_ID: "${NEURIO_CLIENT_ID:-}"
+      NEURIO_CLIENT_SECRET: "${NEURIO_CLIENT_SECRET:-}"
+      NEURIO_GRANT_TYPE: "${NEURIO_GRANT_TYPE:-client_credentials}"
+      NEURIO_CLOUD_SENSOR_ID: "${NEURIO_CLOUD_SENSOR_ID:-}"
+      NEURIO_CLOUD_SYNC_INTERVAL_SECONDS: "${NEURIO_CLOUD_SYNC_INTERVAL_SECONDS:-3600}"
+      NEURIO_CLOUD_TAIL_HOURS: "${NEURIO_CLOUD_TAIL_HOURS:-48}"
+      NEURIO_CLOUD_HARVEST_FROM: "${NEURIO_CLOUD_HARVEST_FROM:-}"
       # Half of Neurio's 144 authorized requests per hour. Ignored until
       # cloud credentials are configured. Override in .env to use more or less.
       NEURIO_CLOUD_MAX_REQUESTS_PER_HOUR: "${NEURIO_CLOUD_MAX_REQUESTS_PER_HOUR:-72}"
