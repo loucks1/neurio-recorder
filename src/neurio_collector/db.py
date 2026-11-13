@@ -1,10 +1,9 @@
 """SQLite storage. WAL, one writer, readers via mode=ro.
 
-Schema 3 stores hourly energy, plus the sensor identity /api/v1/channels
-still serves. Opening a database migrates it: raw-mode tables are dropped,
-space is reclaimed with VACUUM, and schema_version becomes 3.
-hourly_records, hourly_backfill_provenance, sensors, and meta are left in
-place, including their rows and their CREATE statements.
+Opening a database migrates it to SCHEMA_VERSION (currently 4). Raw-mode
+tables are dropped, space is reclaimed with VACUUM, and schema_version is
+rewritten. hourly_records, hourly_backfill_provenance, sensors, and meta
+stay in place, including their rows.
 
 Schema 4 adds hourly_records.ack_required (nullable INTEGER): the
 bridge's per-record statement of whether it expects an ACK, stored at

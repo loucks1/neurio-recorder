@@ -16,14 +16,14 @@ SQLite is in WAL mode with `synchronous=FULL`. One process holds `DATA_DIR/colle
 
 | Table | What it stores |
 |---|---|
-| `meta` | `schema_version` (currently `3`) and any other keys already present |
+| `meta` | `schema_version` (currently `4`) and any other keys already present |
 | `sensors` | The sensor id and `sensor_token` already recorded. Kept so `GET /api/v1/channels` can return `sensor_id`. The token is not served. New hourly records do not add rows |
 | `hourly_records` | One row per bridge hourly energy record: the record id, energy values in integer milli-kWh, the raw JSON, and the time the record was acknowledged |
 | `hourly_backfill_provenance` | Left untouched when it already exists. Live columns: `record_id`, `batch_id`, `action`, `source`, `method`, `approximate`, `detail_json`, `original_row_json`, `applied_at_utc`. This process does not create or modify it |
 | `cloud_hourly_records` | Neurio cloud hourly stats, keyed by the hour's end. Created by cloud ingest on first use; absent until then |
 | `cloud_sync_state` | Cloud ingest progress: harvested range, last attempt/success/error. Created with `cloud_hourly_records` |
 
-Opening the database migrates it to schema 3. The migration drops `sample_channels`, `sample_cts`, `energy_spans`, `counter_epochs`, `samples`, `channels`, and `poll_attempts`, then runs `VACUUM` when it actually dropped tables or the schema version was not yet 3. It does not change rows in `hourly_records`, `hourly_backfill_provenance`, or `sensors`. Running it again is a no-op aside from rewriting `schema_version` to `3`.
+Opening the database migrates it to schema 4. The migration drops `sample_channels`, `sample_cts`, `energy_spans`, `counter_epochs`, `samples`, `channels`, and `poll_attempts`, adds `hourly_records.ack_required` when that column is missing, then runs `VACUUM` when it actually dropped tables or the schema version was not yet 4. It does not change existing hourly, provenance, or sensor values. Running it again is a no-op aside from rewriting `schema_version` to `4`. `ack_required` stays null on rows written before schema 4.
 
 `poll_attempts` was an attempt log. MQTT mode appended a row for each hourly message and connection error, and `/api/v1/status` used to read the latest row. Freshness and storage do not depend on it: the running process keeps the same fields in memory, and after a restart freshness comes from `hourly_records.received_at_utc`. The table is dropped and nothing writes it.
 
@@ -136,7 +136,7 @@ docker compose -f compose.mqtt.yml exec -T neurio-recorder python3 -m neurio_col
 docker compose -f compose.mqtt.yml exec -T neurio-recorder python3 -m neurio_collector verify-backup --src /backups/neurio-YYYYmmddTHHMMSSZ.sqlite
 ```
 
-Take that backup with the current image if you still need the raw tables. `verify-backup` on this version accepts schema versions 1, 2, and 3, and it does not migrate the file it checks. Starting this version is what migrates the live database.
+Take that backup with the current image if you still need the raw tables. `verify-backup` on this version accepts schema versions 1, 2, 3, and 4, and it does not migrate the file it checks. Starting this version is what migrates the live database.
 
 2. Create the data and backup directories if they are not already there, and give uid 10001 write access (`chown 10001:10001`, mode such as `0750`).
 3. Create the password file, mode `0600`, containing only the broker password.
@@ -151,6 +151,8 @@ docker compose -f compose.mqtt.yml exec -T neurio-recorder python3 -m neurio_col
 `/healthz` means the process is up. `device_fresh` is the hourly-message check. A full disk is reported on `/readyz` and does not delete hourly rows.
 
 If a backup timer still points `NEURIO_COMPOSE_FILE` at `compose.yml`, point it at `compose.mqtt.yml`. The example unit and the default in `deploy/online-backup.py` already do.
+
+For a repeatable deploy on the CT105 Docker host (`docker.lan`, `192.168.86.5`) with backups, health checks, and automatic image rollback, see [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Backup and restore
 
@@ -181,6 +183,8 @@ python3 -m neurio_collector restore \
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
+
+CI runs this suite on pull requests and on pushes to `main`, with Python 3.12 (the same version as the image), and runs shellcheck on `scripts/`. See `.github/workflows/ci.yml`.
 
 ## License
 
