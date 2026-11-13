@@ -1,7 +1,7 @@
 #!/bin/sh
 # Pack a source archive. Does not build or run an image.
 set -eu
-root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 out_dir=${1:-"$root/dist"}
 mkdir -p "$out_dir"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
