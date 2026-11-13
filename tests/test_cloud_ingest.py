@@ -12,12 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import support
-from neurio_collector.api import dispatch
+from neurio_collector.api import build_status, dispatch
 from neurio_collector.cloud_client import CloudError, NeurioCloudClient
 from neurio_collector.cloud_ingest import (
     parse_stats_item,
     read_sync_state,
     store_cloud_hours,
+    update_sync_state,
     ws_to_millikwh,
 )
 from neurio_collector.cloud_sync import CloudSyncer, _backoff_seconds
@@ -407,6 +408,83 @@ class SyncTests(unittest.TestCase):
         self.assertIn("cloud_hourly_records", names)
         self.assertIn("cloud_sync_state", names)
 
+    def _seed_tail_state(self, db, last_success=None):
+        """A state row as a long-running install would have: harvest done,
+        with (or without) a recorded last fully successful sync."""
+        update_sync_state(db, harvest_complete=1, sensor_id="sensor-123")
+        if last_success is not None:
+            update_sync_state(db, last_success_at_utc=format_utc(last_success))
+
+    def test_tail_window_is_48h_when_last_success_is_recent(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db)
+        self._seed_tail_state(db, last_success=NOW - timedelta(hours=1))
+        cloud = FakeCloud({})
+        self._syncer(db, cfg, cloud, [NOW]).run_cycle()
+        self.assertTrue(cloud.stats_windows)
+        self.assertEqual(
+            cloud.stats_windows[0][0], int(NOW.timestamp()) - 48 * 3600
+        )
+        self.assertEqual(cloud.stats_windows[-1][1], int(NOW.timestamp()))
+
+    def test_tail_backfills_from_last_success_after_a_long_outage(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db)
+        outage_start = NOW - timedelta(days=5)
+        self._seed_tail_state(db, last_success=outage_start)
+        first_end = int(outage_start.timestamp()) + 3600
+        cloud = FakeCloud(hourly_dataset(first_end, 24 * 5))
+        self._syncer(db, cfg, cloud, [NOW]).run_cycle()
+        self.assertEqual(
+            cloud.stats_windows[0][0], int(outage_start.timestamp())
+        )
+        self.assertEqual(cloud.stats_windows[-1][1], int(NOW.timestamp()))
+        # A mid-outage hour actually landed in the store.
+        mid = first_end + 3600 * 60
+        row = db.conn.execute(
+            "SELECT COUNT(*) AS n FROM cloud_hourly_records "
+            "WHERE hour_end_epoch=?",
+            (mid,),
+        ).fetchone()
+        self.assertEqual(row["n"], 1)
+        state = read_sync_state(db)
+        self.assertEqual(state["last_success_at_utc"], format_utc(NOW))
+
+    def test_failed_pass_keeps_the_watermark_for_the_next_pass(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db)
+        outage_start = NOW - timedelta(days=5)
+        self._seed_tail_state(db, last_success=outage_start)
+        cloud = FakeCloud({})
+        cloud.fail_stats = True
+        self._syncer(db, cfg, cloud, [NOW]).run_cycle()
+        state = read_sync_state(db)
+        self.assertEqual(
+            state["last_success_at_utc"], format_utc(outage_start)
+        )
+        self.assertIsNotNone(state["last_error"])
+        # The next pass still starts at the old watermark, not at -48h.
+        cloud.fail_stats = False
+        cloud.stats_windows.clear()
+        self._syncer(db, cfg, cloud, [NOW]).run_cycle()
+        self.assertEqual(
+            cloud.stats_windows[0][0], int(outage_start.timestamp())
+        )
+        state = read_sync_state(db)
+        self.assertEqual(state["last_success_at_utc"], format_utc(NOW))
+
+    def test_tail_first_run_without_a_recorded_success_uses_48h(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db)
+        self._seed_tail_state(db, last_success=None)
+        cloud = FakeCloud({})
+        self._syncer(db, cfg, cloud, [NOW]).run_cycle()
+        self.assertEqual(
+            cloud.stats_windows[0][0], int(NOW.timestamp()) - 48 * 3600
+        )
+        state = read_sync_state(db)
+        self.assertEqual(state["last_success_at_utc"], format_utc(NOW))
+
     def _syncer(self, db, cfg, cloud, clock_holder, sleeper=None):
         client = NeurioCloudClient(cfg, transport=cloud)
         return CloudSyncer(
@@ -757,6 +835,28 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(section["min_request_interval_seconds"], 50.0)
         self.assertFalse(section["backing_off"])
         self.assertIsNone(section["backoff_until_utc"])
+        self.assertIsNone(section["tail_window_start_utc"])
+
+    def test_status_tail_window_start_reflects_the_watermark(self):
+        db = support.open_db(self)
+        cfg = cloud_config(db)
+        update_sync_state(
+            db,
+            harvest_complete=1,
+            last_success_at_utc=format_utc(NOW - timedelta(days=5)),
+        )
+        section = build_status(cfg, db, None, NOW)["cloud_ingest"]
+        self.assertEqual(
+            section["tail_window_start_utc"],
+            format_utc(NOW - timedelta(days=5)),
+        )
+        # A recent success leaves the plain trailing window.
+        update_sync_state(db, last_success_at_utc=format_utc(NOW - timedelta(hours=1)))
+        section = build_status(cfg, db, None, NOW)["cloud_ingest"]
+        self.assertEqual(
+            section["tail_window_start_utc"],
+            format_utc(NOW - timedelta(hours=48)),
+        )
 
     def test_status_cloud_section_after_sync(self):
         db = support.open_db(self)
