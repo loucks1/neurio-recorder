@@ -5,8 +5,7 @@ cached until shortly before it expires, a 401 forces one token refresh and
 one retry, and error bodies are truncated before they reach an exception
 message. The transport is injectable so tests run against a fake cloud with
 no network. This client is outbound-only and is used solely by cloud
-ingest; the device-polling URL rules (LAN-only, cloud hosts rejected) are
-unaffected.
+ingest, against the NEURIO_CLOUD_API_BASE the operator configured.
 """
 
 from __future__ import annotations

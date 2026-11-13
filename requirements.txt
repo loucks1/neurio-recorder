@@ -1,5 +1,5 @@
 # Runtime dependencies: one pinned third-party package.
 # Everything else in neurio-lan-collector uses the Python 3.12 standard library.
-# paho-mqtt is the MQTT 3.1.1 client for SOURCE_MODE=mqtt; it is imported
-# lazily, so the device and homeassistant modes never touch it.
+# paho-mqtt is the MQTT 3.1.1 client for the hourly MQTT subscriber
+# (SOURCE_MODE=mqtt, the only source mode).
 paho-mqtt==2.2.0
