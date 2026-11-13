@@ -5,6 +5,12 @@ still serves. Opening a database migrates it: raw-mode tables are dropped,
 space is reclaimed with VACUUM, and schema_version becomes 3.
 hourly_records, hourly_backfill_provenance, sensors, and meta are left in
 place, including their rows and their CREATE statements.
+
+Schema 4 adds hourly_records.ack_required (nullable INTEGER): the
+bridge's per-record statement of whether it expects an ACK, stored at
+ingest so /api/v1/status can classify unacked rows without re-reading
+raw payloads. NULL means the payload said nothing — ACK expected,
+exactly as before the column existed.
 """
 
 from __future__ import annotations
@@ -63,14 +69,15 @@ CREATE TABLE IF NOT EXISTS hourly_records (
   consumption_delta_import_millikwh INTEGER,
   phase_a_delta_import_millikwh INTEGER,
   phase_b_delta_import_millikwh INTEGER,
-  acked_at_utc TEXT
+  acked_at_utc TEXT,
+  ack_required INTEGER
 );
 """
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 # verify-backup still accepts a pre-migration copy. Startup rewrites the live
 # database to SCHEMA_VERSION.
-ACCEPTED_SCHEMA_VERSIONS = {"1", "2", "3"}
+ACCEPTED_SCHEMA_VERSIONS = {"1", "2", "3", "4"}
 
 
 def connect_rw(path: str) -> sqlite3.Connection:
@@ -105,6 +112,7 @@ class Database:
 
     def _migrate(self) -> None:
         self.conn.executescript(SCHEMA)
+        self._add_ack_required_column()
         previous = self.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()
@@ -115,12 +123,26 @@ class Database:
         # and a VACUUM that did not, rewrites the file once.
         if dropped or previous_version != SCHEMA_VERSION:
             self.conn.execute("VACUUM")
-        self.conn.execute("PRAGMA user_version=3")
+        self.conn.execute("PRAGMA user_version=4")
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (SCHEMA_VERSION,),
         )
+
+    def _add_ack_required_column(self) -> None:
+        # CREATE TABLE IF NOT EXISTS above does not add columns to a
+        # table that already exists, so a pre-schema-4 hourly_records
+        # gains the column here. Existing rows keep NULL (the payload
+        # said nothing), which the status classification treats as
+        # ACK-expected — the pre-column behaviour.
+        columns = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(hourly_records)")
+        }
+        if "ack_required" not in columns:
+            self.conn.execute(
+                "ALTER TABLE hourly_records ADD COLUMN ack_required INTEGER"
+            )
 
     def _drop_raw_tables(self) -> list[str]:
         existing = {

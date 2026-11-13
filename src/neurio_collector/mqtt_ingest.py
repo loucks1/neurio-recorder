@@ -10,6 +10,13 @@ it instead of dropping an hour of energy data.
 
 Energy values are stored as integer milli-kWh. The payload carries three
 decimal places, so the conversion is exact.
+
+A payload may carry a top-level boolean ``ack_required``: the bridge
+saying whether it expects this record to be acknowledged. It is stored
+as 1/0 in hourly_records.ack_required (NULL when absent or not a
+boolean — never a parse error) so the status endpoint can tell
+"not yet ACKed" apart from "no ACK was ever expected". The ACK itself
+is published either way; the flag only classifies.
 """
 
 from __future__ import annotations
@@ -76,6 +83,8 @@ def store_hourly_record(
     retries = data.get("retries")
     if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
         retries = 0
+    ack_flag = data.get("ack_required")
+    ack_required = (1 if ack_flag else 0) if isinstance(ack_flag, bool) else None
     raw_ts = data.get("timestamp")
     raw_ts_text = raw_ts if isinstance(raw_ts, str) else None
     device_ts = None
@@ -106,8 +115,9 @@ def store_hourly_record(
                 "device_timestamp_utc, retries, received_at_utc, raw_json, "
                 "net_import_millikwh, net_export_millikwh, net_delta_net_millikwh, "
                 "generation_delta_export_millikwh, consumption_delta_import_millikwh, "
-                "phase_a_delta_import_millikwh, phase_b_delta_import_millikwh) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "phase_a_delta_import_millikwh, phase_b_delta_import_millikwh, "
+                "ack_required) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record_id,
                     raw_ts_text,
@@ -116,6 +126,7 @@ def store_hourly_record(
                     format_utc(received_at),
                     text,
                     *values,
+                    ack_required,
                 ),
             )
     return HourlyResult(outcome="stored", record_id=record_id)

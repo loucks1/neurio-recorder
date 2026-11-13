@@ -106,6 +106,10 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
         "last_record_id": None,
         "last_received_at_utc": None,
         "last_acked_at_utc": None,
+        "ack_not_required": None,
+        "ack_pending": None,
+        "ack_pending_oldest_received_at_utc": None,
+        "ack_pending_stuck": None,
     }
     cloud = {
         "configured": cfg.cloud_configured,
@@ -151,6 +155,53 @@ def build_status(cfg: Config, db, poller, now: datetime) -> dict:
                 "last_received_at_utc": agg["last_received"],
                 "last_acked_at_utc": agg["last_acked"],
             }
+            # ACK classification. stored/acked above count every row the
+            # old way; the rows below split the unacked remainder into
+            # "no ACK was ever expected" — cloud-backfill rows (they have
+            # a provenance entry and never arrived via MQTT) and records
+            # the bridge flagged ack_required=false — and genuinely
+            # pending ones. A pending row older than an hour is stuck:
+            # in-flight records are seconds old, so an hour-plus pending
+            # row means the ACK or its bookkeeping failed (see the
+            # poller's ack_mark_failures).
+            has_provenance = reader.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='hourly_backfill_provenance'"
+            ).fetchone() is not None
+            prov = "p.record_id IS NOT NULL" if has_provenance else "0"
+            join = (
+                " LEFT JOIN hourly_backfill_provenance p "
+                "ON p.record_id = h.record_id"
+                if has_provenance
+                else ""
+            )
+            pending = (
+                "h.acked_at_utc IS NULL AND NOT ("
+                + prov
+                + " OR COALESCE(h.ack_required, 1) = 0)"
+            )
+            cls = reader.execute(
+                "SELECT "
+                "SUM(CASE WHEN h.acked_at_utc IS NULL AND ("
+                + prov
+                + " OR h.ack_required = 0) THEN 1 ELSE 0 END) AS not_required, "
+                "SUM(CASE WHEN "
+                + pending
+                + " THEN 1 ELSE 0 END) AS pending, "
+                "MIN(CASE WHEN "
+                + pending
+                + " THEN h.received_at_utc END) AS pending_oldest, "
+                "SUM(CASE WHEN "
+                + pending
+                + " AND h.received_at_utc < ? THEN 1 ELSE 0 END) AS pending_stuck "
+                "FROM hourly_records h"
+                + join,
+                (format_utc(now - timedelta(hours=1)),),
+            ).fetchone()
+            hourly["ack_not_required"] = cls["not_required"] or 0
+            hourly["ack_pending"] = cls["pending"] or 0
+            hourly["ack_pending_oldest_received_at_utc"] = cls["pending_oldest"]
+            hourly["ack_pending_stuck"] = cls["pending_stuck"] or 0
             # The cloud tables are created lazily by cloud ingest, so a
             # database that has never synced has no rows to report rather
             # than an error to hide.

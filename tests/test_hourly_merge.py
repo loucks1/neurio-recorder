@@ -450,7 +450,7 @@ class ProductionProvenanceTests(unittest.TestCase):
         self.assertEqual(status_code, 200, status)
         self.assertTrue(status["db_ok"])
         self.assertTrue(status["device_fresh"])
-        self.assertEqual(status["schema_version"], "3")
+        self.assertEqual(status["schema_version"], "4")
         self.assertEqual(status["counts"]["hourly_records"], 1)
         self.assertEqual(status["merge"]["error"], "merge_unavailable")
         self.assertEqual(status["merge"]["counts"], {"neurio": None, "esp32": None})
